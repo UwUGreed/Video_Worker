@@ -1,0 +1,6 @@
+CMD: ['C:\\Program Files\\nodejs\\node.EXE', 'C:\\video_worker\\render.js', 'C:\\video_worker\\out\\d5a722a5', 'undefined']
+RC: 0
+---STDOUT---
+C:\video_worker\out\d5a722a5\story.png
+
+---STDERR---

@@ -1,0 +1,6 @@
+CMD: ['C:\\Program Files\\nodejs\\node.EXE', 'C:\\video_worker\\render.js', 'C:\\video_worker\\out\\fea32b30', 'audio/wav']
+RC: 0
+---STDOUT---
+C:\video_worker\out\fea32b30\story.png
+
+---STDERR---
