@@ -87,7 +87,7 @@ def build_ffmpeg_cmd(png, audio_wav, scroll_dur, out_path, encoder, filter_mode=
         ).format(width=OUTPUT_WIDTH, height=OUTPUT_HEIGHT, scroll_dur=scroll_dur)
     else:
         filter_complex = (
-            "[1:v]scale={width}:-1:flags=lanczos,format=rgba,"
+            "[0:v]scale={width}:-1:flags=lanczos,format=rgba,"
             "crop={width}:{height}:0:if(gt(ih\\,{height})\\,(ih-{height})*t/{scroll_dur}\\,0)[txt];"
             "[txt]scale={width}:{height}:force_original_aspect_ratio=increase,"
             "crop={width}:{height},format=yuv420p[v]"
