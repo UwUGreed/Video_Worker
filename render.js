@@ -4,7 +4,7 @@ const { execFileSync, spawnSync } = require("child_process");
 
 const CANVAS_WIDTH = 1080;
 const MIN_HEIGHT = 1920;
-const MAX_HEIGHT = 60000;
+const MAX_HEIGHT = 8000;
 const PAGE_BG = "#ffffee";
 const POST_BG = "#f0e0d6";
 const POST_BORDER = "#d9bfb7";

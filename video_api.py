@@ -6,9 +6,9 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 OUT_ROOT = os.path.join(BASE_DIR, "out")
 os.makedirs(OUT_ROOT, exist_ok=True)
 
-OUTPUT_WIDTH = 1280
+OUTPUT_WIDTH = 1080
 OUTPUT_HEIGHT = 720
-OUTPUT_FPS = 24
+OUTPUT_FPS = 12
 OUTPUT_AUDIO_BITRATE = "128k"
 
 def node_exe():
@@ -19,31 +19,21 @@ def node_exe():
 
 def wav_duration_seconds(path):
     try:
-        probe = subprocess.run(
+        result = subprocess.run(
             [
-                "ffprobe",
-                "-v", "error",
+                "ffprobe", "-v", "error",
                 "-show_entries", "format=duration",
                 "-of", "default=noprint_wrappers=1:nokey=1",
                 path
             ],
-            capture_output=True,
-            text=True,
-            timeout=10
+            capture_output=True, text=True, timeout=10
         )
-        value = float((probe.stdout or "").strip())
-        if value > 0:
-            return value
+        val = float(result.stdout.strip())
+        if val > 0:
+            return val
     except Exception:
         pass
-
-    try:
-        with contextlib.closing(wave.open(path, "rb")) as wf:
-            frames = wf.getnframes()
-            rate = wf.getframerate()
-            return max(frames / float(rate), 0.1)
-    except Exception:
-        return 30.0  # fallback
+    return 30.0
 
 def run(cmd, cwd=None):
     p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
@@ -248,13 +238,13 @@ async def render(text: str = Form(...), audio: UploadFile = File(...), image: Up
     encoder = preferred_video_encoder()
     log_job(job, f"encoding video for {dur:.1f}s of audio with {encoder}")
 
-    attempts = []
     if encoder == "h264_nvenc":
-        if gpu_filters_enabled():
-            attempts.append(("h264_nvenc", "gpu", "GPU filters"))
-            attempts.append(("h264_nvenc", "gpu_scale", "GPU scaling"))
-        attempts.append(("h264_nvenc", "cpu", "CPU filters"))
-    attempts.append(("libx264", "cpu", "CPU encode"))
+        attempts = [
+            ("h264_nvenc", "cpu", "NVENC + CPU filters"),
+            ("libx264", "cpu", "CPU encode"),
+        ]
+    else:
+        attempts = [("libx264", "cpu", "CPU encode")]
 
     last_error = None
     for attempt_encoder, filter_mode, label in attempts:
