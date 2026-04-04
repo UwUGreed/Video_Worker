@@ -97,7 +97,6 @@ def build_ffmpeg_cmd(segments_txt, audio_wav, audio_duration, out_path, encoder)
         "-movflags", "+faststart",
         "-shortest",
         "-vsync", "vfr",
-        "-r", str(OUTPUT_FPS),
         "-threads", "0",
         "-progress", "pipe:1",
         "-nostats",
