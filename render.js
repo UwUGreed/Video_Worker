@@ -217,6 +217,10 @@ function quoteConcatPath(filePath) {
   return filePath.replace(/'/g, "'\\''");
 }
 
+function countWords(text) {
+  return String(text || "").trim().split(/\s+/).filter(Boolean).length;
+}
+
 (async () => {
   const outDir = process.argv[2];
   const text = process.argv[3] || "";
@@ -236,9 +240,8 @@ function quoteConcatPath(filePath) {
   const { allLines, totalHeight } = layoutAllLines({ bodyLines, imageHref });
   const baseSegmentCount = Math.max(Math.ceil(totalHeight / VIEWPORT_HEIGHT), 1);
   const numSegments = baseSegmentCount + 1;
-  const secondsPerSegment = audioDurationSeconds / numSegments;
   const lastStartY = Math.max(totalHeight - VIEWPORT_HEIGHT, 0);
-  const segmentFiles = [];
+  const segments = [];
 
   for (let i = 0; i < numSegments; i++) {
     const startY = i < baseSegmentCount ? Math.min(i * VIEWPORT_HEIGHT, lastStartY) : lastStartY;
@@ -246,6 +249,12 @@ function quoteConcatPath(filePath) {
     const stem = `segment_${String(i).padStart(3, "0")}`;
     const tmpSvg = path.join(outDir, `${stem}.svg`);
     const outPng = path.join(outDir, `${stem}.png`);
+    const wordCount = allLines
+      .filter((line) => {
+        const offsetY = line.y - startY;
+        return offsetY >= 0 && offsetY <= VIEWPORT_HEIGHT;
+      })
+      .reduce((total, line) => total + countWords(line.text), 0);
 
     fs.writeFileSync(tmpSvg, svg, "utf8");
     try {
@@ -254,16 +263,18 @@ function quoteConcatPath(filePath) {
       if (fs.existsSync(tmpSvg)) fs.unlinkSync(tmpSvg);
     }
 
-    segmentFiles.push(outPng);
+    segments.push({ file: outPng, wordCount });
   }
 
   const segmentsTxt = path.join(outDir, "segments.txt");
+  const totalWords = segments.map((s) => s.wordCount).reduce((a, b) => a + b, 0);
+  const segmentDurations = segments.map((s) => Math.max(totalWords > 0 ? (s.wordCount / totalWords) * audioDurationSeconds : audioDurationSeconds / Math.max(segments.length, 1), 2.0));
   const lines = [];
-  for (const segmentFile of segmentFiles) {
-    lines.push(`file '${quoteConcatPath(segmentFile)}'`);
-    lines.push(`duration ${secondsPerSegment}`);
+  for (let i = 0; i < segments.length; i++) {
+    lines.push(`file '${quoteConcatPath(segments[i].file)}'`);
+    lines.push(`duration ${segmentDurations[i]}`);
   }
-  const lastSegment = segmentFiles[segmentFiles.length - 1];
+  const lastSegment = segments[segments.length - 1].file;
   lines.push(`file '${quoteConcatPath(lastSegment)}'`);
   lines.push("duration 0.1");
   lines.push(`file '${quoteConcatPath(lastSegment)}'`);
