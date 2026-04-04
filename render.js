@@ -1,6 +1,6 @@
 const fs = require("fs");
 const path = require("path");
-const { execFileSync } = require("child_process");
+const { execFileSync, spawnSync } = require("child_process");
 
 const CANVAS_WIDTH = 1080;
 const MIN_HEIGHT = 1920;
@@ -15,6 +15,15 @@ const TEXT_COLOR = "#789922";
 const FILE_COLOR = "#1f2937";
 const PLACEHOLDER_FG = "#6b4f3c";
 const FONT_FAMILY = "Liberation Sans, Arial, sans-serif";
+
+function resolveMagick() {
+  for (const candidate of ["magick", "convert"]) {
+    const result = spawnSync("bash", ["-lc", `command -v ${candidate}`], { encoding: "utf8" });
+    const resolved = (result.stdout || "").trim();
+    if (result.status === 0 && resolved) return resolved;
+  }
+  throw new Error("ImageMagick not found. Install `magick` or `convert` and ensure it is on PATH.");
+}
 
 function escapeXml(value) {
   return String(value || "")
@@ -183,6 +192,7 @@ function buildSvg({ bodyLines, imageHref }) {
 
   const outPng = path.join(outDir, "story.png");
   const tmpSvg = path.join(outDir, "story.svg");
+  const magickBin = resolveMagick();
   const imageHref = buildImageHref(imageArg);
   const { bodyLines } = splitStory(text);
   const svg = buildSvg({ bodyLines, imageHref });
@@ -190,7 +200,7 @@ function buildSvg({ bodyLines, imageHref }) {
   fs.writeFileSync(tmpSvg, svg, "utf8");
 
   try {
-    execFileSync("/usr/bin/magick", [tmpSvg, "PNG32:" + outPng], { stdio: "pipe" });
+    execFileSync(magickBin, [tmpSvg, "PNG32:" + outPng], { stdio: "pipe" });
   } finally {
     if (fs.existsSync(tmpSvg)) fs.unlinkSync(tmpSvg);
   }
