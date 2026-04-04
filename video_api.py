@@ -19,12 +19,31 @@ def node_exe():
 
 def wav_duration_seconds(path):
     try:
+        probe = subprocess.run(
+            [
+                "ffprobe",
+                "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                path
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        value = float((probe.stdout or "").strip())
+        if value > 0:
+            return value
+    except Exception:
+        pass
+
+    try:
         with contextlib.closing(wave.open(path, "rb")) as wf:
             frames = wf.getnframes()
             rate = wf.getframerate()
             return max(frames / float(rate), 0.1)
     except Exception:
-        return 60.0  # fallback
+        return 30.0  # fallback
 
 def run(cmd, cwd=None):
     p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
