@@ -4,7 +4,6 @@ const { execFileSync, spawnSync } = require("child_process");
 
 const CANVAS_WIDTH = 1080;
 const MIN_HEIGHT = 1920;
-const MAX_HEIGHT = 8000;
 const PAGE_BG = "#ffffee";
 const POST_BG = "#f0e0d6";
 const POST_BORDER = "#d9bfb7";
@@ -16,6 +15,8 @@ const FILE_COLOR = "#1f2937";
 const PLACEHOLDER_FG = "#6b4f3c";
 const FONT_FAMILY = "Liberation Sans, Arial, sans-serif";
 const VIEWPORT_HEIGHT = 720;
+const VIEWPORT_ADVANCE = 520;
+const MIN_SEGMENT_DURATION = 0.35;
 
 function resolveMagick() {
   for (const candidate of ["magick", "convert"]) {
@@ -141,10 +142,63 @@ function layoutAllLines({ bodyLines, imageHref }) {
 
   const contentBottom = Math.max(cursorY, mediaBottom + 16);
   const rawHeight = contentBottom - postY + postPadBottom + pagePaddingBottom;
-  const baseHeight = Math.max(MIN_HEIGHT, rawHeight);
-  const totalHeight = Math.min(baseHeight, MAX_HEIGHT);
+  const totalHeight = Math.max(MIN_HEIGHT, rawHeight);
 
   return { allLines, totalHeight, imageHref };
+}
+
+function buildSegmentStarts(totalHeight) {
+  const lastStartY = Math.max(totalHeight - VIEWPORT_HEIGHT, 0);
+  const starts = [0];
+
+  while (starts[starts.length - 1] < lastStartY) {
+    const nextStart = Math.min(starts[starts.length - 1] + VIEWPORT_ADVANCE, lastStartY);
+    if (nextStart === starts[starts.length - 1]) break;
+    starts.push(nextStart);
+  }
+
+  return starts;
+}
+
+function allocateDurations(weights, totalDuration, minDuration) {
+  if (!weights.length) return [];
+  if (totalDuration <= 0) return weights.map(() => minDuration);
+
+  const safeMin = Math.min(minDuration, totalDuration / weights.length);
+  const totalWeight = weights.reduce((sum, value) => sum + value, 0);
+  let durations = totalWeight > 0
+    ? weights.map((value) => (value / totalWeight) * totalDuration)
+    : weights.map(() => totalDuration / weights.length);
+
+  durations = durations.map((value) => Math.max(value, safeMin));
+
+  let totalAssigned = durations.reduce((sum, value) => sum + value, 0);
+  if (totalAssigned <= totalDuration) {
+    const slack = totalDuration - totalAssigned;
+    durations[durations.length - 1] += slack;
+    return durations;
+  }
+
+  let overflow = totalAssigned - totalDuration;
+  while (overflow > 1e-6) {
+    const adjustable = durations
+      .map((value, index) => ({ index, room: value - safeMin }))
+      .filter((entry) => entry.room > 1e-6);
+
+    if (!adjustable.length) {
+      const even = totalDuration / durations.length;
+      return durations.map(() => even);
+    }
+
+    const totalRoom = adjustable.reduce((sum, entry) => sum + entry.room, 0);
+    for (const entry of adjustable) {
+      const cut = Math.min(entry.room, overflow * (entry.room / totalRoom));
+      durations[entry.index] -= cut;
+      overflow -= cut;
+    }
+  }
+
+  return durations;
 }
 
 function buildSvg({ allLines, imageHref, startY, totalHeight }) {
@@ -238,22 +292,18 @@ function countWords(text) {
   const imageHref = buildImageHref(imageArg);
   const { bodyLines } = splitStory(text);
   const { allLines, totalHeight } = layoutAllLines({ bodyLines, imageHref });
-  const baseSegmentCount = Math.max(Math.ceil(totalHeight / VIEWPORT_HEIGHT), 1);
-  const numSegments = baseSegmentCount + 1;
-  const lastStartY = Math.max(totalHeight - VIEWPORT_HEIGHT, 0);
+  const segmentStarts = buildSegmentStarts(totalHeight);
   const segments = [];
 
-  for (let i = 0; i < numSegments; i++) {
-    const startY = i < baseSegmentCount ? Math.min(i * VIEWPORT_HEIGHT, lastStartY) : lastStartY;
+  for (let i = 0; i < segmentStarts.length; i++) {
+    const startY = segmentStarts[i];
+    const nextStartY = i + 1 < segmentStarts.length ? segmentStarts[i + 1] : totalHeight;
     const svg = buildSvg({ allLines, imageHref, startY, totalHeight });
     const stem = `segment_${String(i).padStart(3, "0")}`;
     const tmpSvg = path.join(outDir, `${stem}.svg`);
     const outPng = path.join(outDir, `${stem}.png`);
     const wordCount = allLines
-      .filter((line) => {
-        const offsetY = line.y - startY;
-        return offsetY >= 0 && offsetY <= VIEWPORT_HEIGHT;
-      })
+      .filter((line) => line.y >= startY && line.y < nextStartY)
       .reduce((total, line) => total + countWords(line.text), 0);
 
     fs.writeFileSync(tmpSvg, svg, "utf8");
@@ -267,16 +317,17 @@ function countWords(text) {
   }
 
   const segmentsTxt = path.join(outDir, "segments.txt");
-  const totalWords = segments.map((s) => s.wordCount).reduce((a, b) => a + b, 0);
-  const segmentDurations = segments.map((s) => Math.max(totalWords > 0 ? (s.wordCount / totalWords) * audioDurationSeconds : audioDurationSeconds / Math.max(segments.length, 1), 2.0));
+  const segmentDurations = allocateDurations(
+    segments.map((s) => s.wordCount),
+    audioDurationSeconds,
+    MIN_SEGMENT_DURATION
+  );
   const lines = [];
   for (let i = 0; i < segments.length; i++) {
     lines.push(`file '${quoteConcatPath(segments[i].file)}'`);
     lines.push(`duration ${segmentDurations[i]}`);
   }
   const lastSegment = segments[segments.length - 1].file;
-  lines.push(`file '${quoteConcatPath(lastSegment)}'`);
-  lines.push("duration 0.1");
   lines.push(`file '${quoteConcatPath(lastSegment)}'`);
   fs.writeFileSync(segmentsTxt, lines.join("\n") + "\n", "utf8");
 

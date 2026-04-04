@@ -7,7 +7,7 @@ It exposes a FastAPI endpoint that:
 - accepts story text
 - accepts a WAV voice track
 - optionally accepts an image
-- renders a scrolling story video
+- renders a fast stepped read-through video of the story post
 - returns the finished `final.mp4`
 
 ## Included Files
@@ -117,6 +117,12 @@ Each render creates a unique job folder under `out/`.
 - in-progress encode: `final.encoding.mp4`
 - finished output: `final.mp4`
 - latest completed copy: `out/current/`
+
+## Render Behavior
+
+- The renderer generates a sequence of overlapping viewport steps through the post instead of a full continuous scroll.
+- Slide timing is distributed to fit the uploaded audio duration so the end of the story is not cut off.
+- Long stories are no longer capped to a fixed layout height before segment generation.
 
 ## Notes
 

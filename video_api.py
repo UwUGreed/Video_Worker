@@ -65,7 +65,7 @@ def preferred_video_encoder():
         return "h264_nvenc"
     return "libx264"
 
-def build_ffmpeg_cmd(segments_txt, audio_wav, audio_duration, out_path, encoder, segment_durations):
+def build_ffmpeg_cmd(segments_txt, audio_wav, audio_duration, out_path, encoder):
     if encoder == "h264_nvenc":
         encode_args = [
             "-c:v", "h264_nvenc",
@@ -82,57 +82,25 @@ def build_ffmpeg_cmd(segments_txt, audio_wav, audio_duration, out_path, encoder,
             "-pix_fmt", "yuv420p",
         ]
 
-    # build xfade filter chain between all segments
-    # each transition is a 0.5s scrollup xfade
-    # xfade offset must be cumulative duration minus transition duration
-    n = len(segment_durations)
-    transition_duration = 0.5
-
-    if n == 1:
-        filter_complex = "[0:v]format=yuv420p[v]"
-        map_arg = "[v]"
-    else:
-        # label each input
-        inputs = "".join(f"[{i}:v]" for i in range(n))
-        
-        # build xfade chain
-        cumulative = 0.0
-        chain = ""
-        prev_label = "[0:v]"
-        for i in range(1, n):
-            cumulative += segment_durations[i - 1]
-            offset = max(cumulative - transition_duration, 0.01)
-            out_label = "[v]" if i == n - 1 else f"[x{i}]"
-            chain += f"{prev_label}[{i}:v]xfade=transition=scrollup:duration={transition_duration}:offset={offset}{out_label};"
-            prev_label = f"[x{i}]"
-        
-        filter_complex = chain.rstrip(";") + ",format=yuv420p"
-        map_arg = "[v]"
-
-    # build input args — one -loop 1 -i per segment PNG
-    # read segment PNGs from segments_txt directory
-    segment_dir = os.path.dirname(segments_txt)
-    segment_files = sorted([
-        f for f in os.listdir(segment_dir) if f.startswith("segment_") and f.endswith(".png")
-    ])
-
-    input_args = []
-    for sf in segment_files:
-        input_args += ["-loop", "1", "-t", str(segment_durations[segment_files.index(sf)] + transition_duration), "-i", os.path.join(segment_dir, sf)]
-
     cmd = [
         "ffmpeg", "-y",
-    ] + input_args + [
+        "-f", "concat",
+        "-safe", "0",
+        "-i", segments_txt,
         "-i", audio_wav,
-        "-filter_complex", filter_complex,
-        "-map", map_arg,
-        "-map", f"{len(segment_files)}:a",
+        "-vf", f"fps={OUTPUT_FPS},scale={OUTPUT_WIDTH}:{OUTPUT_HEIGHT}:flags=lanczos,format=yuv420p",
+        "-map", "0:v:0",
+        "-map", "1:a:0",
         "-t", str(audio_duration),
         "-c:a", "aac",
         "-b:a", OUTPUT_AUDIO_BITRATE,
         "-movflags", "+faststart",
+        "-shortest",
+        "-vsync", "vfr",
         "-r", str(OUTPUT_FPS),
         "-threads", "0",
+        "-progress", "pipe:1",
+        "-nostats",
     ] + encode_args + [out_path]
 
     return cmd
@@ -240,16 +208,6 @@ async def render(text: str = Form(...), audio: UploadFile = File(...), image: Up
         return PlainTextResponse("render.js failed. See: " + os.path.join(od, "render.log"), status_code=500)
     log_job(job, "segments ready")
 
-    segment_durations = []
-    with open(segments_txt) as f:
-        for line in f:
-            line = line.strip()
-            if line.startswith("duration"):
-                segment_durations.append(float(line.split()[1]))
-    # remove the last duplicate entry duration
-    if segment_durations:
-        segment_durations = segment_durations[:-1]
-
     # 2) combine segments + audio
     out_mp4 = os.path.join(od, "final.mp4")
     out_tmp_mp4 = os.path.join(od, "final.encoding.mp4")
@@ -271,7 +229,7 @@ async def render(text: str = Form(...), audio: UploadFile = File(...), image: Up
             if attempt_encoder != encoder or filter_mode != attempts[0][1]:
                 log_job(job, f"retrying with {attempt_encoder} and {label.lower()}")
             run_ffmpeg_with_progress(
-                build_ffmpeg_cmd(segments_txt, audio_wav, dur, out_tmp_mp4, attempt_encoder, segment_durations),
+                build_ffmpeg_cmd(segments_txt, audio_wav, dur, out_tmp_mp4, attempt_encoder),
                 cwd=od,
                 duration_seconds=dur,
                 job=job
