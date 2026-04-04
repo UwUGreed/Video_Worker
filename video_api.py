@@ -89,16 +89,16 @@ def build_ffmpeg_cmd(png, audio_wav, scroll_dur, out_path, encoder, filter_mode=
         filter_complex = (
             "[1:v]scale={width}:-1:flags=lanczos,format=rgba,"
             "crop={width}:{height}:0:if(gt(ih\\,{height})\\,(ih-{height})*t/{scroll_dur}\\,0)[txt];"
-            "[0:v][txt]overlay=0:0,format=yuv420p[v]"
+            "[txt]scale={width}:{height}:force_original_aspect_ratio=increase,"
+            "crop={width}:{height},format=yuv420p[v]"
         ).format(width=OUTPUT_WIDTH, height=OUTPUT_HEIGHT, scroll_dur=scroll_dur)
 
     cmd = [
         "ffmpeg","-y",
-        "-f","lavfi","-i",f"color=size={OUTPUT_WIDTH}x{OUTPUT_HEIGHT}:rate={OUTPUT_FPS}:color=black",
         "-loop","1","-i", png,
         "-i", audio_wav,
         "-filter_complex", filter_complex,
-        "-map","[v]","-map","2:a",
+        "-map","[v]","-map","1:a",
     ]
 
     if encoder == "h264_nvenc":
@@ -233,7 +233,9 @@ async def render(text: str = Form(...), audio: UploadFile = File(...), image: Up
     dur = wav_duration_seconds(audio_wav)
     out_mp4 = os.path.join(od, "final.mp4")
     out_tmp_mp4 = os.path.join(od, "final.encoding.mp4")
-    scroll_dur = max(dur - 0.35, 0.1)
+    scrollable_px = 8000 - OUTPUT_HEIGHT
+    px_per_second = 120
+    scroll_dur = max(scrollable_px / px_per_second, 1.0)
 
     encoder = preferred_video_encoder()
     log_job(job, f"encoding video for {dur:.1f}s of audio with {encoder}")
