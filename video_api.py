@@ -233,9 +233,7 @@ async def render(text: str = Form(...), audio: UploadFile = File(...), image: Up
     dur = wav_duration_seconds(audio_wav)
     out_mp4 = os.path.join(od, "final.mp4")
     out_tmp_mp4 = os.path.join(od, "final.encoding.mp4")
-    scrollable_px = 8000 - OUTPUT_HEIGHT
-    px_per_second = 120
-    scroll_dur = max(scrollable_px / px_per_second, 1.0)
+    scroll_dur = max(dur, 1.0)
 
     encoder = preferred_video_encoder()
     log_job(job, f"encoding video for {dur:.1f}s of audio with {encoder}")
