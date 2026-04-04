@@ -1,0 +1,176 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=1080, initial-scale=1" />
+  <style>
+    :root {
+      --bg: #ffffee;
+      --post-bg: #f0e0d6;
+      --post-border: #d9bfb7;
+      --name: #117743;
+      --meta: #707070;
+      --title: #0f0c5d;
+      --text: #789922;
+      --greentext: #789922;
+      --file: #1f2937;
+      --placeholder-bg: linear-gradient(135deg, #f6eadf 0%, #e8d4c3 100%);
+      --placeholder-fg: #6b4f3c;
+    }
+
+    * { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; background: var(--bg); }
+    body {
+      width: 1080px;
+      min-height: 1920px;
+      padding: 40px 28px 120px;
+      font-family: Arial, Helvetica, sans-serif;
+      color: var(--text);
+    }
+
+    .thread-shell {
+      width: 100%;
+      display: flex;
+      flex-direction: column;
+      gap: 18px;
+    }
+
+    .board-bar {
+      padding: 16px 20px;
+      border: 1px solid #c5cedf;
+      background: linear-gradient(180deg, #f7eddc 0%, #ead6c5 100%);
+      color: #800000;
+      font-size: 30px;
+      font-weight: 700;
+      letter-spacing: 0.02em;
+    }
+
+    .post {
+      width: 100%;
+      border: 1px solid var(--post-border);
+      background: var(--post-bg);
+      padding: 22px 22px 30px;
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.45);
+    }
+
+    .meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: baseline;
+      margin-bottom: 16px;
+      font-size: 28px;
+      line-height: 1.25;
+    }
+
+    .name {
+      color: var(--name);
+      font-weight: 700;
+    }
+
+    .subject {
+      color: var(--title);
+      font-weight: 700;
+    }
+
+    .details {
+      color: var(--meta);
+    }
+
+    .content {
+      display: flow-root;
+    }
+
+    .media {
+      float: left;
+      width: 240px;
+      margin: 6px 22px 16px 0;
+    }
+
+    .fileline {
+      margin-bottom: 8px;
+      color: var(--file);
+      font-size: 20px;
+      line-height: 1.3;
+    }
+
+    .thumb {
+      width: 240px;
+      height: 240px;
+      border: 1px solid #b99987;
+      background: var(--placeholder-bg);
+      position: relative;
+      overflow: hidden;
+      display: grid;
+      place-items: center;
+    }
+
+    .thumb img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      display: none;
+      position: relative;
+      z-index: 1;
+    }
+
+    .thumb::before {
+      content: "";
+      position: absolute;
+      inset: 0;
+      background:
+        linear-gradient(45deg, rgba(255,255,255,0.18) 25%, transparent 25%, transparent 50%, rgba(255,255,255,0.18) 50%, rgba(255,255,255,0.18) 75%, transparent 75%, transparent);
+      background-size: 44px 44px;
+      opacity: 0.6;
+    }
+
+    .thumb-label {
+      position: relative;
+      z-index: 1;
+      padding: 14px;
+      text-align: center;
+      font-size: 22px;
+      line-height: 1.25;
+      font-weight: 700;
+      color: var(--placeholder-fg);
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+
+    .body {
+      font-size: 34px;
+      line-height: 1.34;
+      color: var(--greentext);
+    }
+
+    .line {
+      display: block;
+      white-space: pre-wrap;
+      word-wrap: break-word;
+      color: var(--greentext);
+    }
+  </style>
+</head>
+<body>
+  <div class="thread-shell">
+    <div class="board-bar">/x/ - auto thread capture</div>
+    <article class="post">
+      <div class="meta">
+        <span class="name">Anonymous</span>
+        <span class="subject" id="title">Story</span>
+        <span class="details">04/02/26(Fri)12:00:00 No.427001337</span>
+      </div>
+      <div class="content">
+        <div class="media">
+          <div class="fileline">File: placeholder.jpg (280 KB, 280x280)</div>
+          <div class="thumb">
+            <img id="post-image" alt="Post image" />
+            <div id="image-placeholder" class="thumb-label">Image Placeholder</div>
+          </div>
+        </div>
+        <div id="body" class="body"></div>
+      </div>
+    </article>
+  </div>
+</body>
+</html>
