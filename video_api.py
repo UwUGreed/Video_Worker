@@ -1,6 +1,6 @@
-﻿import os, uuid, subprocess, shutil, wave, contextlib, time
-from fastapi import FastAPI, UploadFile, File, Form
-from fastapi.responses import FileResponse, PlainTextResponse
+﻿import base64, json, os, uuid, subprocess, shutil, time
+from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks
+from fastapi.responses import FileResponse, PlainTextResponse, JSONResponse
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 OUT_ROOT = os.path.join(BASE_DIR, "out")
@@ -10,6 +10,20 @@ OUTPUT_WIDTH = 1080
 OUTPUT_HEIGHT = 720
 OUTPUT_FPS = 12
 OUTPUT_AUDIO_BITRATE = "128k"
+DEFAULT_X264_PRESET = "veryfast"
+DEFAULT_X264_CRF = "18"
+DEFAULT_NVENC_PRESET = "p5"
+DEFAULT_NVENC_CQ = "20"
+DEFAULT_BACKGROUND_MUSIC_VOLUME = 0.04
+DEFAULT_BACKGROUND_MUSIC_CANDIDATES = (
+    os.path.join("assets", "lofi-bed.mp3"),
+    os.path.join("assets", "lofi-bed.wav"),
+    os.path.join("assets", "lofi-bed.m4a"),
+    os.path.join("assets", "lofi-bed.aac"),
+    os.path.join("assets", "lofi-bed.ogg"),
+    os.path.join("assets", "lofi-bed.flac"),
+)
+SHORTS_OUTPUT_DIR = os.path.join(BASE_DIR, "shorts", "clips")
 
 def node_exe():
     n = shutil.which("node")
@@ -50,6 +64,8 @@ def ffmpeg_has_encoder(name):
     return p.returncode == 0 and name in (p.stdout or "")
 
 def nvidia_runtime_available():
+    if not shutil.which("nvidia-smi"):
+        return False
     p = subprocess.run(
         ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
         capture_output=True,
@@ -65,8 +81,54 @@ def preferred_video_encoder():
         return "h264_nvenc"
     return "libx264"
 
+def video_encoder_settings(encoder):
+    if encoder == "h264_nvenc":
+        preset = (os.environ.get("VIDEO_NVENC_PRESET") or "").strip() or DEFAULT_NVENC_PRESET
+        quality_value = (os.environ.get("VIDEO_NVENC_CQ") or "").strip() or DEFAULT_NVENC_CQ
+        return {
+            "codec": "h264_nvenc",
+            "preset_flag": "-preset",
+            "preset_value": preset,
+            "quality_flag": "-cq",
+            "quality_value": quality_value,
+        }
+
+    preset = (os.environ.get("VIDEO_X264_PRESET") or "").strip() or DEFAULT_X264_PRESET
+    quality_value = (os.environ.get("VIDEO_X264_CRF") or "").strip() or DEFAULT_X264_CRF
+    return {
+        "codec": "libx264",
+        "preset_flag": "-preset",
+        "preset_value": preset,
+        "quality_flag": "-crf",
+        "quality_value": quality_value,
+    }
+
 def log_job(job, message, end="\n"):
     print(f"[render:{job}] {message}", end=end, flush=True)
+
+def background_music_volume():
+    raw = (os.environ.get("VIDEO_BACKGROUND_MUSIC_VOLUME") or "").strip()
+    if not raw:
+        return DEFAULT_BACKGROUND_MUSIC_VOLUME
+    try:
+        value = float(raw)
+    except ValueError:
+        return DEFAULT_BACKGROUND_MUSIC_VOLUME
+    return max(0.0, min(value, 1.0))
+
+def resolve_background_music_path():
+    configured = (os.environ.get("VIDEO_BACKGROUND_MUSIC") or "").strip()
+    if configured:
+        candidate = configured if os.path.isabs(configured) else os.path.join(BASE_DIR, configured)
+        if os.path.exists(candidate):
+            return candidate
+        return ""
+
+    for rel_path in DEFAULT_BACKGROUND_MUSIC_CANDIDATES:
+        candidate = os.path.join(BASE_DIR, rel_path)
+        if os.path.exists(candidate):
+            return candidate
+    return ""
 
 def run_ffmpeg_with_progress(cmd, cwd, duration_seconds, job):
     p = subprocess.Popen(
@@ -128,10 +190,107 @@ def cleanup_dir(path):
     if os.path.isdir(path):
         shutil.rmtree(path, ignore_errors=True)
 
+def encode_file_base64(path):
+    with open(path, "rb") as f:
+        return base64.b64encode(f.read()).decode("ascii")
+
+def auto_shorts_enabled():
+    raw = (os.environ.get("VIDEO_AUTO_SHORTS") or "").strip().lower()
+    if not raw:
+        return True
+    return raw not in {"0", "false", "no", "off"}
+
+def write_json(path, payload):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+
+
+def log_cleanup_summary(job, summary):
+    if not summary:
+        return
+    log_job(
+        job,
+        (
+            "storage cleanup: "
+            f"render_dirs={summary.get('render_dirs_deleted', 0)}, "
+            f"orphan_clips={summary.get('orphan_clips_deleted', 0)}, "
+            f"queue_pruned={summary.get('queue_entries_pruned', 0)}, "
+            f"freed_bytes={summary.get('freed_bytes', 0)}"
+        ),
+    )
+    errors = summary.get("errors") or []
+    if errors:
+        log_job(job, "storage cleanup warnings: " + "; ".join(errors[:3]))
+
+def generate_shorts_for_render(job, source_video, job_dir):
+    log_path = os.path.join(job_dir, "shorts.log")
+    manifest_path = os.path.join(job_dir, "shorts_manifest.json")
+    active_marker_path = os.path.join(job_dir, ".shorts_in_progress")
+    cleanup_runner = None
+
+    try:
+        from shorts.karen_clipper import generate_featured_shorts
+        from shorts.publisher import register_generated_shorts, run_storage_maintenance
+        cleanup_runner = run_storage_maintenance
+
+        os.makedirs(SHORTS_OUTPUT_DIR, exist_ok=True)
+        with open(active_marker_path, "w", encoding="utf-8") as f:
+            f.write("running\n")
+        log_job(job, "auto shorts started")
+        short_items = generate_featured_shorts(
+            source_video,
+            output_dir=SHORTS_OUTPUT_DIR,
+            base_name_override=f"{job}_short",
+            return_metadata=True,
+        )
+        short_paths = [item["output_path"] for item in short_items]
+        queued_entries = register_generated_shorts(job, short_items)
+        write_json(
+            manifest_path,
+            {
+                "job_id": job,
+                "source_video": source_video,
+                "shorts": short_paths,
+                "queued": [entry["queue_id"] for entry in queued_entries],
+            },
+        )
+        with open(log_path, "w", encoding="utf-8") as f:
+            f.write("status=ok\n")
+            for path in short_paths:
+                f.write(path + "\n")
+        log_job(job, f"auto shorts ready: {len(short_paths)} clips")
+    except Exception as e:
+        with open(log_path, "w", encoding="utf-8") as f:
+            f.write("status=error\n")
+            f.write(str(e) + "\n")
+        log_job(job, f"auto shorts failed: {e}")
+    finally:
+        if os.path.exists(active_marker_path):
+            try:
+                os.unlink(active_marker_path)
+            except OSError:
+                pass
+        try:
+            if cleanup_runner is None:
+                from shorts.publisher import run_storage_maintenance
+
+                cleanup_runner = run_storage_maintenance
+            cleanup_summary = cleanup_runner()
+        except Exception as cleanup_error:
+            log_job(job, f"storage cleanup failed: {cleanup_error}")
+        else:
+            log_cleanup_summary(job, cleanup_summary)
+
 app = FastAPI()
 
 @app.post("/render")
-async def render(text: str = Form(...), audio: UploadFile = File(...), image: UploadFile | None = File(None)):
+async def render(
+    background_tasks: BackgroundTasks,
+    text: str = Form(...),
+    audio: UploadFile = File(...),
+    image: UploadFile | None = File(None),
+    music: UploadFile | None = File(None)
+):
     job = uuid.uuid4().hex[:12]
     od = os.path.join(OUT_ROOT, job)
     os.makedirs(od, exist_ok=True)
@@ -147,6 +306,22 @@ async def render(text: str = Form(...), audio: UploadFile = File(...), image: Up
         image_path = os.path.join(od, f"image{ext}")
         with open(image_path, "wb") as f:
             f.write(await image.read())
+
+    background_music_path = ""
+    mix_volume = background_music_volume()
+    if music and music.filename:
+        ext = os.path.splitext(music.filename)[1].lower() or ".mp3"
+        background_music_path = os.path.join(od, f"music{ext}")
+        with open(background_music_path, "wb") as f:
+            f.write(await music.read())
+        log_job(job, f"using uploaded background music at volume {mix_volume:.2f}")
+    else:
+        default_music_path = resolve_background_music_path()
+        if default_music_path:
+            ext = os.path.splitext(default_music_path)[1].lower() or ".mp3"
+            background_music_path = os.path.join(od, f"music{ext}")
+            shutil.copyfile(default_music_path, background_music_path)
+            log_job(job, f"using default background music at volume {mix_volume:.2f}")
 
     # 1) render scroll.webm via node/playwright
     dur = wav_duration_seconds(audio_wav)
@@ -173,22 +348,42 @@ async def render(text: str = Form(...), audio: UploadFile = File(...), image: Up
     out_tmp_mp4 = os.path.join(od, "final.encoding.mp4")
 
     encoder = preferred_video_encoder()
-    log_job(job, f"muxing video with {encoder}")
+    encoder_settings = video_encoder_settings(encoder)
+    log_job(
+        job,
+        (
+            f"muxing video with {encoder_settings['codec']} "
+            f"({encoder_settings['preset_flag'][1:]}={encoder_settings['preset_value']}, "
+            f"{encoder_settings['quality_flag'][1:]}={encoder_settings['quality_value']})"
+        )
+    )
 
-    mux_cmd = [
-        "ffmpeg", "-y",
-        "-i", scroll_webm,
-        "-i", audio_wav,
-        "-c:v", "h264_nvenc" if encoder == "h264_nvenc" else "libx264",
-        "-preset", "p1" if encoder == "h264_nvenc" else "ultrafast",
-        "-crf" if encoder == "libx264" else "-cq", "26" if encoder == "libx264" else "28",
+    mux_cmd = ["ffmpeg", "-y", "-i", scroll_webm, "-i", audio_wav]
+    if background_music_path:
+        mux_cmd.extend([
+            "-stream_loop", "-1",
+            "-i", background_music_path,
+            "-filter_complex",
+            (
+                f"[1:a]aresample=async=1:first_pts=0[voice];"
+                f"[2:a]aresample=async=1:first_pts=0,volume={mix_volume:.3f}[music];"
+                "[voice][music]amix=inputs=2:duration=first:dropout_transition=2[aout]"
+            ),
+            "-map", "0:v:0",
+            "-map", "[aout]",
+        ])
+
+    mux_cmd.extend([
+        "-c:v", encoder_settings["codec"],
+        encoder_settings["preset_flag"], encoder_settings["preset_value"],
+        encoder_settings["quality_flag"], encoder_settings["quality_value"],
         "-pix_fmt", "yuv420p",
         "-c:a", "aac",
         "-b:a", OUTPUT_AUDIO_BITRATE,
         "-movflags", "+faststart",
         "-shortest",
         out_tmp_mp4
-    ]
+    ])
 
     try:
         run_ffmpeg_with_progress(mux_cmd, cwd=od, duration_seconds=dur, job=job)
@@ -205,6 +400,13 @@ async def render(text: str = Form(...), audio: UploadFile = File(...), image: Up
     cleanup_dir(latest_dir)
     shutil.copytree(od, latest_dir)
 
+    if auto_shorts_enabled():
+        background_tasks.add_task(generate_shorts_for_render, job, out_mp4, od)
+    else:
+        from shorts.publisher import run_storage_maintenance
+
+        background_tasks.add_task(run_storage_maintenance)
+
     response = FileResponse(out_mp4, media_type="video/mp4", filename="final.mp4")
     response.headers["Content-Disposition"] = 'attachment; filename="final.mp4"; filename*=UTF-8\'\'final.mp4'
     response.headers["Content-Type"] = "video/mp4"
@@ -212,6 +414,64 @@ async def render(text: str = Form(...), audio: UploadFile = File(...), image: Up
     response.headers["X-Filename"] = "final.mp4"
     response.headers["X-Job-Id"] = job
     log_job(job, f"done: {out_mp4}")
+    return response
+
+
+@app.post("/render_shorts")
+async def render_shorts(video: UploadFile = File(...)):
+    job = uuid.uuid4().hex[:12]
+    od = os.path.join(OUT_ROOT, f"shorts_{job}")
+    os.makedirs(od, exist_ok=True)
+    log_job(job, "shorts job started")
+
+    ext = os.path.splitext(video.filename or "")[1].lower() or ".mp4"
+    source_video = os.path.join(od, f"source{ext}")
+    with open(source_video, "wb") as f:
+        f.write(await video.read())
+
+    shorts_dir = os.path.join(od, "clips")
+    os.makedirs(shorts_dir, exist_ok=True)
+
+    try:
+        from shorts.karen_clipper import generate_featured_shorts
+        short_paths = generate_featured_shorts(source_video, output_dir=shorts_dir)
+    except Exception as e:
+        log_job(job, f"shorts render failed: {e}")
+        return PlainTextResponse("shorts render failed: " + str(e), status_code=500)
+
+    latest_dir = os.path.join(OUT_ROOT, "current_shorts")
+    cleanup_dir(latest_dir)
+    shutil.copytree(od, latest_dir)
+
+    payload = {
+        "job_id": job,
+        "encoding": "base64",
+        "mime_type": "video/mp4",
+        "short_count": len(short_paths),
+        "short1": None,
+        "short2": None,
+        "short3": None,
+        "short1_filename": None,
+        "short2_filename": None,
+        "short3_filename": None,
+    }
+
+    for idx, path in enumerate(short_paths[:3], 1):
+        payload[f"short{idx}"] = encode_file_base64(path)
+        payload[f"short{idx}_filename"] = os.path.basename(path)
+
+    try:
+        from shorts.publisher import run_storage_maintenance
+
+        cleanup_summary = run_storage_maintenance()
+    except Exception as cleanup_error:
+        log_job(job, f"storage cleanup failed: {cleanup_error}")
+    else:
+        log_cleanup_summary(job, cleanup_summary)
+
+    log_job(job, f"done shorts: {shorts_dir}")
+    response = JSONResponse(payload)
+    response.headers["X-Job-Id"] = job
     return response
 
 

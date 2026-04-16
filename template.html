@@ -5,9 +5,11 @@
   <meta name="viewport" content="width=1080, initial-scale=1" />
   <style>
     :root {
-      --bg: #ffffee;
-      --post-bg: #f0e0d6;
-      --post-border: #d9bfb7;
+      --bg-top: #617387;
+      --bg-mid: #93818d;
+      --bg-bottom: #f1e0cd;
+      --post-bg: rgba(240, 224, 214, 0.9);
+      --post-border: rgba(217, 191, 183, 0.95);
       --name: #117743;
       --meta: #707070;
       --title: #0f0c5d;
@@ -16,11 +18,18 @@
       --file: #1f2937;
       --placeholder-bg: linear-gradient(135deg, #f6eadf 0%, #e8d4c3 100%);
       --placeholder-fg: #6b4f3c;
+      --frame-shadow: rgba(68, 48, 43, 0.12);
     }
 
     * { box-sizing: border-box; }
-    html, body { margin: 0; padding: 0; background: var(--bg); }
+    html, body {
+      margin: 0;
+      padding: 0;
+      background: linear-gradient(180deg, var(--bg-top) 0%, var(--bg-mid) 42%, var(--bg-bottom) 100%);
+    }
     body {
+      position: relative;
+      isolation: isolate;
       width: 1080px;
       height: auto;
       overflow-y: auto;
@@ -29,7 +38,114 @@
       color: var(--text);
     }
 
+    .scene {
+      position: fixed;
+      inset: 0;
+      z-index: 0;
+      overflow: hidden;
+      pointer-events: none;
+    }
+
+    .scene-sky,
+    .scene-haze,
+    .scene-window,
+    .scene-moon,
+    .scene-cityline,
+    .scene-desk,
+    .scene-grain {
+      position: absolute;
+    }
+
+    .scene-sky {
+      inset: 0;
+      background:
+        radial-gradient(circle at 18% 16%, rgba(255, 211, 158, 0.22) 0%, rgba(255, 211, 158, 0.08) 12%, transparent 28%),
+        radial-gradient(circle at 82% 18%, rgba(255, 247, 224, 0.14) 0%, rgba(255, 247, 224, 0.05) 8%, transparent 18%),
+        linear-gradient(180deg, var(--bg-top) 0%, var(--bg-mid) 44%, var(--bg-bottom) 100%);
+    }
+
+    .scene-haze {
+      inset: -12%;
+      background:
+        radial-gradient(circle at 12% 24%, rgba(255, 181, 126, 0.18) 0%, transparent 26%),
+        radial-gradient(circle at 68% 26%, rgba(255, 229, 194, 0.12) 0%, transparent 18%),
+        radial-gradient(circle at 46% 78%, rgba(211, 149, 124, 0.14) 0%, transparent 30%);
+      filter: blur(34px);
+      opacity: 0.9;
+      animation: slow-drift 18s ease-in-out infinite alternate;
+    }
+
+    .scene-window {
+      top: 58px;
+      right: 54px;
+      width: 312px;
+      height: 224px;
+      border: 14px solid rgba(83, 65, 59, 0.16);
+      border-bottom-width: 18px;
+      background:
+        linear-gradient(90deg, transparent 49%, rgba(83, 65, 59, 0.16) 49%, rgba(83, 65, 59, 0.16) 51%, transparent 51%),
+        linear-gradient(180deg, transparent 48%, rgba(83, 65, 59, 0.16) 48%, rgba(83, 65, 59, 0.16) 52%, transparent 52%),
+        linear-gradient(180deg, rgba(113, 130, 152, 0.24) 0%, rgba(162, 128, 132, 0.2) 58%, rgba(236, 205, 176, 0.16) 100%);
+      box-shadow:
+        0 24px 50px rgba(44, 31, 36, 0.08),
+        inset 0 0 0 1px rgba(255, 255, 255, 0.14);
+      opacity: 0.7;
+      transform: rotate(-1.2deg);
+    }
+
+    .scene-moon {
+      top: 88px;
+      right: 156px;
+      width: 118px;
+      height: 118px;
+      border-radius: 50%;
+      background:
+        radial-gradient(circle at 36% 36%, rgba(255, 252, 242, 0.98) 0%, rgba(253, 233, 188, 0.92) 44%, rgba(253, 233, 188, 0.3) 67%, rgba(253, 233, 188, 0) 75%);
+      box-shadow: 0 0 58px rgba(250, 231, 183, 0.22);
+      opacity: 0.85;
+      animation: float-moon 12s ease-in-out infinite;
+    }
+
+    .scene-cityline {
+      left: -4%;
+      right: -4%;
+      bottom: 108px;
+      height: 188px;
+      background:
+        linear-gradient(180deg, rgba(52, 39, 46, 0) 0%, rgba(52, 39, 46, 0.18) 34%, rgba(52, 39, 46, 0.52) 100%);
+      clip-path: polygon(
+        0 100%, 0 72%, 5% 72%, 5% 58%, 9% 58%, 9% 76%, 14% 76%, 14% 44%, 18% 44%, 18% 70%,
+        23% 70%, 23% 50%, 28% 50%, 28% 80%, 33% 80%, 33% 40%, 37% 40%, 37% 65%, 42% 65%,
+        42% 54%, 47% 54%, 47% 77%, 52% 77%, 52% 36%, 56% 36%, 56% 62%, 61% 62%, 61% 48%,
+        66% 48%, 66% 73%, 71% 73%, 71% 41%, 75% 41%, 75% 68%, 80% 68%, 80% 56%, 85% 56%,
+        85% 78%, 91% 78%, 91% 46%, 96% 46%, 96% 64%, 100% 64%, 100% 100%
+      );
+      opacity: 0.42;
+    }
+
+    .scene-desk {
+      left: -6%;
+      right: -6%;
+      bottom: 0;
+      height: 158px;
+      background:
+        radial-gradient(circle at 50% -10%, rgba(255, 201, 146, 0.14) 0%, rgba(255, 201, 146, 0.02) 24%, transparent 42%),
+        linear-gradient(180deg, rgba(87, 61, 51, 0) 0%, rgba(87, 61, 51, 0.16) 18%, rgba(87, 61, 51, 0.54) 100%);
+      box-shadow: 0 -36px 88px rgba(61, 42, 36, 0.12);
+    }
+
+    .scene-grain {
+      inset: -50%;
+      background-image: radial-gradient(rgba(255, 255, 255, 0.09) 0.7px, transparent 0.7px);
+      background-size: 24px 24px;
+      opacity: 0.14;
+      mix-blend-mode: soft-light;
+      animation: grain-shift 10s steps(4) infinite;
+    }
+
     .thread-shell {
+      position: relative;
+      z-index: 1;
       width: 100%;
       display: flex;
       flex-direction: column;
@@ -39,11 +155,13 @@
     .board-bar {
       padding: 16px 20px;
       border: 1px solid #c5cedf;
-      background: linear-gradient(180deg, #f7eddc 0%, #ead6c5 100%);
+      background: linear-gradient(180deg, rgba(247, 237, 220, 0.92) 0%, rgba(234, 214, 197, 0.86) 100%);
       color: #800000;
       font-size: 30px;
       font-weight: 700;
       letter-spacing: 0.02em;
+      box-shadow: 0 16px 34px var(--frame-shadow);
+      backdrop-filter: blur(6px);
     }
 
     .post {
@@ -51,7 +169,10 @@
       border: 1px solid var(--post-border);
       background: var(--post-bg);
       padding: 22px 22px 30px;
-      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.45);
+      box-shadow:
+        0 18px 40px var(--frame-shadow),
+        inset 0 1px 0 rgba(255, 255, 255, 0.45);
+      backdrop-filter: blur(6px);
     }
 
     .meta {
@@ -150,9 +271,37 @@
       word-wrap: break-word;
       color: var(--greentext);
     }
+
+    @keyframes slow-drift {
+      0% { transform: translate3d(-2%, 0, 0) scale(1); }
+      100% { transform: translate3d(2%, -1.5%, 0) scale(1.04); }
+    }
+
+    @keyframes float-moon {
+      0% { transform: translateY(0); }
+      50% { transform: translateY(-7px); }
+      100% { transform: translateY(0); }
+    }
+
+    @keyframes grain-shift {
+      0% { transform: translate(0, 0); }
+      25% { transform: translate(-2%, 1%); }
+      50% { transform: translate(1%, -1%); }
+      75% { transform: translate(-1%, -2%); }
+      100% { transform: translate(0, 0); }
+    }
   </style>
 </head>
 <body>
+  <div class="scene" aria-hidden="true">
+    <div class="scene-sky"></div>
+    <div class="scene-haze"></div>
+    <div class="scene-window"></div>
+    <div class="scene-moon"></div>
+    <div class="scene-cityline"></div>
+    <div class="scene-desk"></div>
+    <div class="scene-grain"></div>
+  </div>
   <div class="thread-shell">
     <div class="board-bar">/x/ - auto thread capture</div>
     <article class="post">

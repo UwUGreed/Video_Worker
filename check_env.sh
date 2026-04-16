@@ -24,5 +24,19 @@ fi
 echo "Checking NVENC availability..."
 ffmpeg -hide_banner -encoders | grep -E "h264_nvenc|hevc_nvenc" || true
 
-echo "Environment check complete."
+echo "Checking optional Python packages..."
+python3 - <<'PY'
+mods = [
+    ("whisper", "shorts transcription"),
+    ("googleapiclient", "YouTube uploads"),
+    ("google_auth_oauthlib", "YouTube OAuth"),
+]
+for mod, label in mods:
+    try:
+        __import__(mod)
+        print(f"{label}: ok")
+    except Exception:
+        print(f"{label}: missing")
+PY
 
+echo "Environment check complete."

@@ -1,0 +1,8 @@
+[Unit]
+Description=Prune Video Worker storage, logs, and posted short history
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/video-worker
+EnvironmentFile=-/opt/video-worker/shorts/youtube.env
+ExecStart=/opt/video-worker/.venv/bin/python /opt/video-worker/shorts/run_maintenance.py

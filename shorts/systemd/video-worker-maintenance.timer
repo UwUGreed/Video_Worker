@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Video Worker storage maintenance on a rolling schedule
+
+[Timer]
+OnBootSec=15m
+OnUnitActiveSec=1h
+Persistent=true
+Unit=video-worker-maintenance.service
+
+[Install]
+WantedBy=timers.target

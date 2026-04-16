@@ -1,0 +1,12 @@
+[Unit]
+Description=Run the Video Worker shorts poster on the daily publishing schedule
+
+[Timer]
+OnCalendar=*-*-* 07:30:00
+OnCalendar=*-*-* 12:30:00
+OnCalendar=*-*-* 16:30:00
+Persistent=true
+Unit=video-worker-shorts-poster.service
+
+[Install]
+WantedBy=timers.target

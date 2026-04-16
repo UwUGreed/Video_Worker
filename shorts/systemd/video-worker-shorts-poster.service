@@ -1,0 +1,10 @@
+[Unit]
+Description=Upload the next queued Video Worker short to YouTube
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/video-worker
+EnvironmentFile=/opt/video-worker/shorts/youtube.env
+ExecStart=/opt/video-worker/.venv/bin/python /opt/video-worker/shorts/post_next_short.py
