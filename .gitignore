@@ -10,7 +10,6 @@ shorts/credentials/*
 !shorts/credentials/.gitkeep
 shorts/state/*
 !shorts/state/.gitkeep
-shorts/youtube.env
 assets/lofi-bed.mp3
 assets/lofi-bed.zip
 assets/lofi-bed.wav
@@ -23,3 +22,4 @@ __pycache__/
 *.pyo
 *.swp
 .DS_Store
+video-worker-server-bundle*.tar.gz

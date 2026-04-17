@@ -25,6 +25,9 @@ It exposes a FastAPI endpoint that:
 - `start_video.sh`: starts the API server
 - `setup.sh`: bootstraps Python and Node dependencies
 - `check_env.sh`: verifies host dependencies
+- `create_server_bundle.sh`: packages the repo plus env files for server transfer
+- `install_systemd_services.sh`: installs the API service and shorts timers
+- `video-worker.env.example`: runtime overrides for the API service
 - `shorts/`: clip generation, queueing, local YouTube poster, and Linux timer templates
 
 ## What You Need On The Target Server
@@ -46,7 +49,7 @@ For GPU encoding:
 
 ## Recommended Transfer Flow
 
-1. Push this folder to GitHub as its own repo or as a subfolder in your repo.
+1. Use either a private Git repo or `./create_server_bundle.sh`.
 2. On the new server:
 
 ```bash
@@ -57,6 +60,8 @@ source .venv/bin/activate
 ./check_env.sh
 ./start_video.sh
 ```
+
+For the full unattended server path, including env transfer, YouTube credential transfer, and systemd installation, follow [SERVER_SETUP.md](/home/Anon/Desktop/Github/Video_Worker/SERVER_SETUP.md:1).
 
 ## Server Startup
 
@@ -70,6 +75,8 @@ You can override them:
 ```bash
 HOST=0.0.0.0 PORT=8002 ./start_video.sh
 ```
+
+If you want those settings to persist for systemd, copy `video-worker.env.example` to `video-worker.env` and set them there.
 
 ## Runtime Environment Flags
 
@@ -194,6 +201,7 @@ Scheduled YouTube posting:
 - the included schedule is `07:30`, `12:30`, and `16:30` every day
 - an hourly maintenance timer is also included to keep storage trimmed
 - full setup instructions live in `shorts/README.md`
+- the unattended server install flow lives in [SERVER_SETUP.md](/home/Anon/Desktop/Github/Video_Worker/SERVER_SETUP.md:1)
 
 ## Shorts Endpoint
 

@@ -20,10 +20,18 @@ This folder now handles the full shorts pipeline:
   - uploads the next queued short to YouTube
 - `post_next_short.py`
   - CLI entrypoint for the local daemon or manual posting
+- `publish_instagram.py`
+  - posts one local mp4 to Instagram as a Reel
+- `publish_tiktok.py`
+  - posts one local mp4 directly to TikTok
 - `run_maintenance.py`
   - manual storage cleanup command
 - `youtube.env.example`
   - environment template for YouTube posting
+- `instagram.env.example`
+  - environment template for Instagram Reel posting
+- `tiktok.env.example`
+  - environment template for TikTok direct posting
 - `systemd/`
   - Linux service + timer templates for posting plus rolling maintenance
 - `clips/`
@@ -178,12 +186,13 @@ python3 shorts/run_maintenance.py
 
 ## Linux Scheduled Posting
 
-This repo includes systemd templates:
+This repo includes systemd templates and a root-level installer:
 
 - `shorts/systemd/video-worker-shorts-poster.service`
 - `shorts/systemd/video-worker-shorts-poster.timer`
 - `shorts/systemd/video-worker-maintenance.service`
 - `shorts/systemd/video-worker-maintenance.timer`
+- `../install_systemd_services.sh`
 
 They are configured for:
 
@@ -192,24 +201,25 @@ They are configured for:
 - `16:30`
 - hourly maintenance cleanup
 
-### 1. Replace the repo path
+### 1. Recommended install path
 
-The template assumes the repo lives at:
+The easiest way to install the API service plus both timers is:
+
+```bash
+sudo ./install_systemd_services.sh
+```
+
+That script automatically writes units for the current repo path, runs them as the repo owner by default, enables the API service, and enables both timers.
+
+### 2. Manual template install
+
+If you prefer to copy the templates yourself, the template path assumes the repo lives at:
 
 ```bash
 /opt/video-worker
 ```
 
-If your repo lives elsewhere, edit all copied systemd files and replace `/opt/video-worker` with your real repo path.
-
-### 2. Install the files
-
-```bash
-sudo cp shorts/systemd/video-worker-shorts-poster.service /etc/systemd/system/
-sudo cp shorts/systemd/video-worker-shorts-poster.timer /etc/systemd/system/
-sudo cp shorts/systemd/video-worker-maintenance.service /etc/systemd/system/
-sudo cp shorts/systemd/video-worker-maintenance.timer /etc/systemd/system/
-```
+If your repo lives elsewhere, edit the copied unit files and replace `/opt/video-worker` with your real repo path.
 
 ### 3. Enable the timer
 
@@ -277,3 +287,265 @@ That means:
 - If you want to customize the clickbait title format, edit `build_youtube_title()` in `shorts/karen_clipper.py`.
 - If you want different hashtags or tags, update `shorts/youtube.env`.
 - If you want to keep local posted shorts, set `VIDEO_DELETE_POSTED_SHORTS=0`.
+
+## Manual Instagram Reel Posting
+
+These commands are separate from the YouTube queue. They publish a specific local mp4 file that you point them at.
+
+### 1. Create the env file
+
+```bash
+cp shorts/instagram.env.example shorts/instagram.env
+```
+
+Fill in:
+
+- `INSTAGRAM_IG_USER_ID`
+- `INSTAGRAM_ACCESS_TOKEN`
+- `INSTAGRAM_APP_SECRET` (optional but recommended for app secret proof)
+- `INSTAGRAM_PUBLISH_METHOD=quick_tunnel` to use the default temporary public URL flow
+- `INSTAGRAM_CTA_TEXT` if you want to change the default follow call-to-action
+- `INSTAGRAM_HASHTAGS` if you want Instagram-specific hashtags. If unset, Instagram reuses `YOUTUBE_HASHTAGS`.
+
+The default Instagram path now hosts the local mp4 on a temporary localhost server, exposes it through a short-lived Cloudflare quick tunnel, sends that public `video_url` to Instagram, waits for processing to finish, then tears the tunnel down. That means `cloudflared` must be installed on the machine that runs the publish script.
+By default, Instagram captions also append `Dont forget to Like and follow` plus the same short-form hashtags used elsewhere in the project.
+
+### 2. Meta app setup
+
+Use the official Instagram Platform content publishing flow:
+
+- connect an Instagram professional account to a Facebook Page
+- create a Meta app
+- enable Instagram Platform / content publishing
+- obtain an access token with publishing permissions
+
+Official docs:
+
+- `https://developers.facebook.com/docs/instagram-platform/content-publishing/`
+- `https://developers.facebook.com/docs/instagram-platform/instagram-graph-api/reference/ig-user/media`
+
+Install Cloudflare Tunnel for the default local-file publishing path:
+
+- `https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/do-more-with-tunnels/trycloudflare/`
+- `https://developers.cloudflare.com/tunnel/setup/`
+
+### 3. Publish a Reel
+
+```bash
+source .venv/bin/activate
+set -a
+source shorts/instagram.env
+set +a
+python3 shorts/publish_instagram.py \
+  --file shorts/clips/example.mp4 \
+  --caption "Example reel caption #shorts"
+```
+
+Useful flags:
+
+- `--reels-only`
+  - skip sharing to the main feed
+- `--thumb-offset-ms 1000`
+  - choose a frame from the video for the cover
+- `--cover-url https://.../cover.jpg`
+  - use a public JPEG as the cover image
+- `--resumable-upload`
+  - use the older Meta resumable upload flow instead of the default quick tunnel
+
+Notes:
+
+- Quick tunnels are intended for testing and development. They are a pragmatic fallback for this project, but they are not Cloudflare's recommended production setup.
+- `--no-wait` is only safe with `--resumable-upload`. The quick tunnel path must stay alive until Instagram finishes fetching the video.
+- If you already have a publish-capable Meta Graph token and want the old behavior, set `INSTAGRAM_PUBLISH_METHOD=resumable`.
+- This machine may not always be able to resolve the random `trycloudflare.com` hostname immediately even when Instagram can. The script treats the local probe as best-effort and waits for the Instagram container status as the real success signal.
+
+## Manual TikTok Direct Posting
+
+These commands are also separate from the YouTube queue. They can either publish a specific local mp4 file directly to TikTok or upload it to TikTok as a draft for manual editing.
+
+### 1. Create the env file
+
+```bash
+cp shorts/tiktok.env.example shorts/tiktok.env
+```
+
+Fill in:
+
+- `TIKTOK_CLIENT_KEY`
+- `TIKTOK_CLIENT_SECRET`
+- `TIKTOK_REDIRECT_URI`
+- `TIKTOK_ACCESS_TOKEN`
+- `TIKTOK_REFRESH_TOKEN` once you complete OAuth
+- `TIKTOK_PUBLISH_BACKEND=native` for the direct TikTok API, or `buffer` to publish through Buffer instead
+- `TIKTOK_DESCRIPTION_TEXT` if you want to change the default TikTok description line
+- `BUFFER_API_KEY` if you use the Buffer backend
+- optionally `BUFFER_TIKTOK_CHANNEL_ID` or `BUFFER_TIKTOK_CHANNEL_NAME` if the Buffer account has more than one TikTok channel connected
+
+### 2. TikTok app setup
+
+Use the official TikTok Content Posting API flow:
+
+- create a TikTok developer app
+- add the Content Posting API product
+- enable Direct Post
+- get approval for the `video.publish` scope if you want direct posting
+- get approval for the `video.upload` scope if you want inbox draft uploads
+- add a Login Kit redirect URI such as `http://localhost:6583/callback/`
+- run OAuth for the TikTok account that should receive the post
+
+Official docs:
+
+- `https://developers.tiktok.com/doc/content-posting-api-get-started/`
+- `https://developers.tiktok.com/doc/content-posting-api-reference-direct-post`
+- `https://developers.tiktok.com/doc/content-posting-api-reference-upload-video`
+- `https://developers.tiktok.com/doc/oauth-user-access-token-management/`
+
+Important:
+
+- unaudited TikTok apps are restricted to private posting
+- the script queries creator settings first and honors the privacy levels returned by TikTok
+- the client key and secret alone are not enough to post; TikTok posting still requires a user access token with `video.publish`
+- draft upload uses the separate `video.upload` scope and delivers the clip to TikTok's inbox flow for final editing/posting
+- if `TIKTOK_PUBLISH_BACKEND=buffer`, the script posts through Buffer's TikTok integration instead of TikTok's native Content Posting API and reuses the local Cloudflare quick-tunnel flow to host the video temporarily
+
+### 3. Local OAuth flow
+
+The easiest local flow is to register `http://localhost:6583/callback/` in TikTok and let the helper listen on that port. It generates the authorize URL, waits for TikTok to redirect back to the local callback, exchanges the code automatically, and writes the returned tokens into `shorts/tiktok.env`.
+
+```bash
+source .venv/bin/activate
+set -a
+source shorts/tiktok.env
+set +a
+python3 shorts/tiktok_token.py local-oauth --scope "user.info.basic,video.publish,video.upload" --open-browser
+```
+
+If you prefer to do the code exchange manually after TikTok redirects back with `?code=...`, you can still run:
+
+```bash
+source .venv/bin/activate
+set -a
+source shorts/tiktok.env
+set +a
+python3 shorts/tiktok_token.py exchange-code \
+  --code "<tiktok_oauth_code>" \
+  --redirect-uri "http://localhost:6583/callback/" \
+  --code-verifier "<pkce_code_verifier>" \
+  --print-env
+```
+
+If your access token expires later, refresh it with:
+
+```bash
+source .venv/bin/activate
+set -a
+source shorts/tiktok.env
+set +a
+python3 shorts/tiktok_token.py refresh --print-env
+```
+
+### 4. Publish a video
+
+```bash
+source .venv/bin/activate
+set -a
+source shorts/tiktok.env
+set +a
+python3 shorts/publish_tiktok.py \
+  --file shorts/clips/example.mp4 \
+  --title "Example TikTok caption #storytime"
+```
+
+Useful flags:
+
+- `--privacy-level SELF_ONLY`
+- `--disable-comment`
+- `--disable-duet`
+- `--disable-stitch`
+- `--cover-timestamp-ms 1000`
+- `--aigc`
+
+To publish through Buffer instead of the native TikTok API:
+
+```bash
+source .venv/bin/activate
+set -a
+source shorts/tiktok.env
+set +a
+python3 shorts/publish_tiktok.py \
+  --file shorts/clips/example.mp4 \
+  --title "Example TikTok caption #storytime" \
+  --buffer
+```
+
+Buffer backend notes:
+
+- `--buffer` is equivalent to `TIKTOK_PUBLISH_BACKEND=buffer`
+- Buffer delivery currently supports caption + video only from this script, and it reuses the same default TikTok caption builder
+- by default the TikTok caption includes the provided title, `TIKTOK_DESCRIPTION_TEXT`, `TIKTOK_CTA_TEXT`, and `TIKTOK_HASHTAGS`
+- Buffer publishing keeps a temporary Cloudflare URL alive while the post sends, so `--no-wait` is intentionally not supported there
+
+### 5. Upload a TikTok draft
+
+```bash
+source .venv/bin/activate
+set -a
+source shorts/tiktok.env
+set +a
+python3 shorts/publish_tiktok.py \
+  --file shorts/clips/example.mp4 \
+  --draft
+```
+
+Important:
+
+- draft upload uses TikTok's inbox flow instead of creating the post immediately
+- TikTok's video draft upload API does not accept caption/privacy metadata up front, so you finish those inside TikTok after the inbox notification arrives
+- TikTok does not guarantee a short processing window for inbox delivery, so `SEND_TO_USER_INBOX` may take longer than the local poll timeout on some uploads
+- if you only need the `publish_id`, add `--no-wait` and check the status later with `shorts/tiktok_status.py`
+- draft upload remains native-only and is not available when `TIKTOK_PUBLISH_BACKEND=buffer`
+
+### 6. Check TikTok upload status
+
+```bash
+source .venv/bin/activate
+set -a
+source shorts/tiktok.env
+set +a
+python3 shorts/tiktok_status.py v_inbox_file~v2.123456789
+```
+
+To keep polling until TikTok reaches a terminal state:
+
+```bash
+python3 shorts/tiktok_status.py v_inbox_file~v2.123456789 --watch
+```
+
+## Python Integration
+
+If you want to call the new publishers from your own code instead of the CLI wrappers:
+
+```python
+from shorts.publisher import post_reel_to_instagram, post_video_to_tiktok
+
+instagram_result = post_reel_to_instagram(
+    "shorts/clips/example.mp4",
+    "Example reel caption #shorts",
+)
+
+tiktok_result = post_video_to_tiktok(
+    "shorts/clips/example.mp4",
+    "Example TikTok caption #storytime",
+)
+```
+
+### Recommended integration pattern
+
+Keep these as separate calls from the existing YouTube queue for now:
+
+1. render or generate the short
+2. call `post_next_short.py` for YouTube if you want the queued YouTube flow
+3. call `publish_instagram.py` for Instagram if you want the same clip there
+4. call `publish_tiktok.py` for TikTok if you want the same clip there
+
+That keeps the current YouTube systemd timer working while you experiment with Instagram and TikTok credentials.

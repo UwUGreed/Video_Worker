@@ -8,11 +8,31 @@ echo "Checking Node..."
 node --version
 npm --version
 
+echo "Checking Playwright..."
+npx playwright --version
+node - <<'JS'
+const fs = require("fs");
+const { chromium } = require("playwright");
+const browserPath = chromium.executablePath();
+console.log(`playwright chromium: ${browserPath}`);
+if (!fs.existsSync(browserPath)) {
+  process.exitCode = 1;
+  console.error("playwright chromium binary is missing");
+}
+JS
+
 echo "Checking ffmpeg..."
 ffmpeg -hide_banner -version | head -n 1
 
 echo "Checking ImageMagick..."
 magick -version | head -n 2
+
+echo "Checking cloudflared..."
+if command -v cloudflared >/dev/null 2>&1; then
+  cloudflared --version | head -n 1
+else
+  echo "cloudflared not found"
+fi
 
 echo "Checking NVIDIA runtime..."
 if command -v nvidia-smi >/dev/null 2>&1; then

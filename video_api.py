@@ -1,4 +1,4 @@
-﻿import base64, json, os, uuid, subprocess, shutil, time
+import base64, json, os, uuid, subprocess, shutil, time
 from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks
 from fastapi.responses import FileResponse, PlainTextResponse, JSONResponse
 
@@ -282,6 +282,18 @@ def generate_shorts_for_render(job, source_video, job_dir):
             log_cleanup_summary(job, cleanup_summary)
 
 app = FastAPI()
+
+
+@app.get("/healthz")
+async def healthz():
+    return JSONResponse(
+        {
+            "status": "ok",
+            "auto_shorts": auto_shorts_enabled(),
+            "output_root": OUT_ROOT,
+            "shorts_output_dir": SHORTS_OUTPUT_DIR,
+        }
+    )
 
 @app.post("/render")
 async def render(
