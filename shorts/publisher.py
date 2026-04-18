@@ -657,7 +657,7 @@ def should_finalize_queue_entry_after_social_failures(active_platforms, platform
 
 def post_reserved_queue_entry_to_platforms(entry, *, interactive_auth=False, platform_targets=None):
     platform_targets = dict(platform_targets or queue_platform_targets())
-    active_platforms = [name for name in ("youtube", "tiktok", "instagram") if platform_targets.get(name)]
+    active_platforms = [name for name in ("youtube", "instagram", "tiktok") if platform_targets.get(name)]
     if not active_platforms:
         raise RuntimeError("No enabled platforms were selected for this queued short.")
 
@@ -1728,6 +1728,154 @@ def serve_file_over_http(file_path):
         thread.join(timeout=5)
 
 
+@contextmanager
+def serve_files_over_http(file_paths):
+    targets = {
+        name: Path(path).expanduser().resolve()
+        for name, path in dict(file_paths or {}).items()
+        if path
+    }
+    if not targets:
+        raise RuntimeError("No files were provided for the temporary media server.")
+    for target in targets.values():
+        if not target.exists():
+            raise FileNotFoundError(target)
+
+    route_targets = {}
+    urls = {}
+    for name, target in targets.items():
+        route = f"/{uuid.uuid4().hex}{target.suffix or '.bin'}"
+        route_targets[route] = target
+        urls[name] = {
+            "file_path": str(target),
+            "route": route,
+        }
+
+    class MultiFileRequestHandler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_GET(self):
+            self._serve(send_body=True)
+
+        def do_HEAD(self):
+            self._serve(send_body=False)
+
+        def log_message(self, format_text, *args):
+            return
+
+        def _serve(self, *, send_body):
+            request_path = urlsplit(self.path).path
+            target = route_targets.get(request_path)
+            if target is None:
+                print(
+                    "temporary media server: "
+                    f"{self.command} {request_path} -> 404 expected={','.join(route_targets)}",
+                    file=sys.stderr,
+                )
+                self.send_error(404)
+                return
+
+            try:
+                total_size = target.stat().st_size
+            except OSError:
+                self.send_error(404)
+                return
+
+            start = 0
+            end = max(total_size - 1, 0)
+            partial = False
+            range_header = self.headers.get("Range")
+            if range_header:
+                byte_range = parse_http_byte_range(range_header, total_size)
+                if byte_range is None:
+                    self.send_response(416)
+                    self.send_header("Content-Range", f"bytes */{total_size}")
+                    self.send_header("Content-Length", "0")
+                    self.send_header("Connection", "close")
+                    self.close_connection = True
+                    self.end_headers()
+                    return
+                start, end = byte_range
+                partial = True
+
+            content_length = max(end - start + 1, 0)
+            content_type = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+            self.send_response(206 if partial else 200)
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Cache-Control", "public, max-age=600")
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Disposition", f'inline; filename="{target.name}"')
+            self.send_header("Content-Length", str(content_length))
+            self.send_header("Connection", "close")
+            self.close_connection = True
+            if partial:
+                self.send_header("Content-Range", f"bytes {start}-{end}/{total_size}")
+            self.end_headers()
+
+            status_code = 206 if partial else 200
+            print(
+                "temporary media server: "
+                f"{self.command} {request_path} -> {status_code} "
+                f"range={range_header or '-'} bytes={content_length}/{total_size}",
+                file=sys.stderr,
+            )
+
+            if not send_body or content_length <= 0:
+                return
+
+            bytes_sent = 0
+            with open(target, "rb") as handle:
+                handle.seek(start)
+                remaining = content_length
+                while remaining > 0:
+                    chunk = handle.read(min(1024 * 1024, remaining))
+                    if not chunk:
+                        break
+                    try:
+                        self.wfile.write(chunk)
+                    except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                        print(
+                            "temporary media server: "
+                            f"{self.command} {request_path} disconnected after {bytes_sent}/{content_length} bytes",
+                            file=sys.stderr,
+                        )
+                        return
+                    bytes_sent += len(chunk)
+                    remaining -= len(chunk)
+            try:
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                print(
+                    "temporary media server: "
+                    f"{self.command} {request_path} disconnected during flush after {bytes_sent}/{content_length} bytes",
+                    file=sys.stderr,
+                )
+                return
+            print(
+                "temporary media server: "
+                f"{self.command} {request_path} completed {bytes_sent}/{content_length} bytes",
+                file=sys.stderr,
+            )
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), MultiFileRequestHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    local_origin = f"http://127.0.0.1:{server.server_address[1]}"
+
+    try:
+        for item in urls.values():
+            item["local_origin"] = local_origin
+            item["local_url"] = f"{local_origin}{item['route']}"
+        yield {
+            "local_origin": local_origin,
+            "files": urls,
+        }
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
 def terminate_subprocess(process):
     if process is None or process.poll() is not None:
         return
@@ -1900,6 +2048,59 @@ def temporary_instagram_video_url(file_path, settings=None):
 
         with active_stack:
             yield hosted_video
+        return
+
+    raise RuntimeError(
+        f"Cloudflare quick tunnel failed after {max_attempts} attempts. Last error: {last_error}"
+    ) from last_error
+
+
+@contextmanager
+def temporary_buffer_media_urls(file_paths, settings=None, probe_name="video"):
+    settings = settings or buffer_settings()
+    max_attempts = max(int(settings.get("quick_tunnel_max_attempts") or 1), 1)
+    retry_delay_seconds = max(int(settings.get("quick_tunnel_retry_delay_seconds") or 1), 1)
+    last_error = None
+
+    for attempt in range(1, max_attempts + 1):
+        active_stack = ExitStack()
+        try:
+            local_server = active_stack.enter_context(serve_files_over_http(file_paths))
+            tunnel = active_stack.enter_context(
+                cloudflare_quick_tunnel(local_server["local_origin"], settings=settings)
+            )
+            hosted_files = {}
+            for name, item in (local_server.get("files") or {}).items():
+                hosted_files[name] = dict(item)
+                hosted_files[name]["public_origin"] = tunnel["public_origin"]
+                hosted_files[name]["public_url"] = f"{tunnel['public_origin']}{item['route']}"
+
+            settle_seconds = max(int(settings.get("quick_tunnel_settle_seconds") or 0), 0)
+            if settle_seconds > 0:
+                time.sleep(settle_seconds)
+
+            probe_item = hosted_files.get(probe_name) or next(iter(hosted_files.values()))
+            probe = wait_for_public_video_url(
+                probe_item["public_url"],
+                timeout_seconds=max(settings["quick_tunnel_grace_seconds"], 0),
+                required=True,
+                doh_url=(settings.get("quick_tunnel_doh_url") or "").strip(),
+            )
+            hosted_media = {
+                "public_origin": tunnel["public_origin"],
+                "files": hosted_files,
+                "probe": probe,
+            }
+        except Exception as exc:
+            active_stack.close()
+            last_error = exc
+            if attempt >= max_attempts:
+                break
+            time.sleep(retry_delay_seconds * attempt)
+            continue
+
+        with active_stack:
+            yield hosted_media
         return
 
     raise RuntimeError(
@@ -2161,97 +2362,105 @@ def post_reel_to_instagram_via_buffer(
         return accept_buffer_instagram_result(existing_result)
 
     with sanitized_instagram_upload_file(target) as upload_target:
-        with temporary_buffer_video_url(upload_target, settings=buffer) as hosted_video:
-            create_post_input = {
-                "text": instagram_caption,
-                "channelId": channel["id"],
-                "schedulingType": "automatic",
-                "mode": "shareNow",
-                "source": "video_worker_instagram_buffer",
-                "metadata": {
-                    "instagram": {
-                        "type": "reel",
-                        "shouldShareToFeed": share_value,
-                    }
-                },
-                "assets": {
-                    "videos": [
-                        {
-                            "url": hosted_video["public_url"],
+        with instagram_video_thumbnail_file(upload_target) as thumbnail_target:
+            with temporary_buffer_media_urls(
+                {"video": upload_target, "thumbnail": thumbnail_target},
+                settings=buffer,
+                probe_name="video",
+            ) as hosted_media:
+                hosted_video = hosted_media["files"]["video"]
+                hosted_thumbnail = hosted_media["files"]["thumbnail"]
+                create_post_input = {
+                    "text": instagram_caption,
+                    "channelId": channel["id"],
+                    "schedulingType": "automatic",
+                    "mode": "shareNow",
+                    "source": "video_worker_instagram_buffer",
+                    "metadata": {
+                        "instagram": {
+                            "type": "reel",
+                            "shouldShareToFeed": share_value,
                         }
-                    ]
-                },
-            }
-            create_post_input.update(buffer_instagram_reel_input_fields(settings=buffer))
-            created = buffer_graphql(
-                buffer,
-                """
-                mutation CreatePost($input: CreatePostInput!) {
-                  createPost(input: $input) {
-                    __typename
-                    ... on PostActionSuccess {
-                      post {
-                        id
-                        status
-                        text
-                        shareMode
-                        schedulingType
-                        sharedNow
-                        assets {
-                          id
-                          mimeType
-                          source
+                    },
+                    "assets": {
+                        "videos": [
+                            {
+                                "url": hosted_video["public_url"],
+                                "thumbnailUrl": hosted_thumbnail["public_url"],
+                            }
+                        ]
+                    },
+                }
+                create_post_input.update(buffer_instagram_reel_input_fields(settings=buffer))
+                created = buffer_graphql(
+                    buffer,
+                    """
+                    mutation CreatePost($input: CreatePostInput!) {
+                      createPost(input: $input) {
+                        __typename
+                        ... on PostActionSuccess {
+                          post {
+                            id
+                            status
+                            text
+                            shareMode
+                            schedulingType
+                            sharedNow
+                            assets {
+                              id
+                              mimeType
+                              source
+                            }
+                          }
+                        }
+                        ... on MutationError {
+                          message
                         }
                       }
                     }
-                    ... on MutationError {
-                      message
-                    }
-                  }
-                }
-                """,
-                variables={
-                    "input": create_post_input,
-                },
-                default_message="Buffer Instagram createPost failed.",
-            ).get("createPost") or {}
+                    """,
+                    variables={
+                        "input": create_post_input,
+                    },
+                    default_message="Buffer Instagram createPost failed.",
+                ).get("createPost") or {}
 
-            if created.get("__typename") != "PostActionSuccess":
-                message = (created.get("message") or "Buffer Instagram createPost failed.").strip()
-                raise RuntimeError(message)
+                if created.get("__typename") != "PostActionSuccess":
+                    message = (created.get("message") or "Buffer Instagram createPost failed.").strip()
+                    raise RuntimeError(message)
 
-            post_snapshot = created.get("post") or {}
-            print(
-                "Buffer Instagram createPost asset snapshot: "
-                f"{json.dumps(post_snapshot.get('assets') or [], sort_keys=True, default=str)}",
-                file=sys.stderr,
-            )
-            print(
-                "Buffer Instagram createPost state: "
-                f"id={post_snapshot.get('id') or ''} "
-                f"status={post_snapshot.get('status') or ''} "
-                f"shareMode={post_snapshot.get('shareMode') or ''} "
-                f"schedulingType={post_snapshot.get('schedulingType') or ''} "
-                f"sharedNow={post_snapshot.get('sharedNow')}",
-                file=sys.stderr,
-            )
-            accepted_result = accept_buffer_instagram_result(
-                build_buffer_instagram_result(
-                    post_snapshot,
-                    channel,
-                    target,
-                    instagram_caption,
-                    hosted_video_url=hosted_video["public_url"],
+                post_snapshot = created.get("post") or {}
+                print(
+                    "Buffer Instagram createPost asset snapshot: "
+                    f"{json.dumps(post_snapshot.get('assets') or [], sort_keys=True, default=str)}",
+                    file=sys.stderr,
                 )
-            )
-            accepted_result["share_to_feed"] = share_value
-            if progress_callback and accepted_result:
-                progress_callback(accepted_result)
+                print(
+                    "Buffer Instagram createPost state: "
+                    f"id={post_snapshot.get('id') or ''} "
+                    f"status={post_snapshot.get('status') or ''} "
+                    f"shareMode={post_snapshot.get('shareMode') or ''} "
+                    f"schedulingType={post_snapshot.get('schedulingType') or ''} "
+                    f"sharedNow={post_snapshot.get('sharedNow')}",
+                    file=sys.stderr,
+                )
+                accepted_result = accept_buffer_instagram_result(
+                    build_buffer_instagram_result(
+                        post_snapshot,
+                        channel,
+                        target,
+                        instagram_caption,
+                        hosted_video_url=hosted_video["public_url"],
+                    )
+                )
+                accepted_result["share_to_feed"] = share_value
+                if progress_callback and accepted_result:
+                    progress_callback(accepted_result)
 
-            hold_seconds = int(buffer.get("tunnel_hold_seconds") or 0)
-            hold_buffer_tunnel_for_fetch("Instagram", hosted_video, hold_seconds)
+                hold_seconds = int(buffer.get("tunnel_hold_seconds") or 0)
+                hold_buffer_tunnel_for_fetch("Instagram", hosted_video, hold_seconds)
 
-            return accepted_result
+                return accepted_result
 
 
 def post_reel_to_instagram(
@@ -3254,6 +3463,56 @@ def sanitized_instagram_upload_file(file_path):
     finally:
         try:
             sanitized_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+@contextmanager
+def instagram_video_thumbnail_file(file_path):
+    target = Path(file_path).expanduser().resolve()
+    if not target.exists():
+        raise FileNotFoundError(target)
+
+    ffmpeg_bin = shutil.which("ffmpeg")
+    if not ffmpeg_bin:
+        raise RuntimeError("ffmpeg is required to prepare Instagram thumbnails.")
+
+    with tempfile.NamedTemporaryFile(prefix="instagram-thumbnail-", suffix=".jpg", delete=False) as handle:
+        thumbnail_path = Path(handle.name)
+
+    cmd = [
+        ffmpeg_bin,
+        "-y",
+        "-ss",
+        "00:00:01",
+        "-i",
+        str(target),
+        "-frames:v",
+        "1",
+        "-vf",
+        "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2,setsar=1",
+        "-q:v",
+        "2",
+        str(thumbnail_path),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        try:
+            thumbnail_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise RuntimeError(f"Instagram thumbnail generation failed: {result.stderr[-500:]}")
+
+    try:
+        print(
+            "instagram thumbnail: "
+            f"size={thumbnail_path.stat().st_size / 1024:.1f}KB",
+            file=sys.stderr,
+        )
+        yield thumbnail_path
+    finally:
+        try:
+            thumbnail_path.unlink(missing_ok=True)
         except OSError:
             pass
 
