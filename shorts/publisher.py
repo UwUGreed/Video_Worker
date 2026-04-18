@@ -2734,33 +2734,7 @@ def query_buffer_create_post_input_fields(settings=None):
 
 
 def buffer_instagram_reel_input_fields(settings=None):
-    settings = settings or buffer_settings()
-    cached_fields = load_buffer_schema_cache(settings=settings).get("instagram_reel_input_fields") or {}
-    if cached_fields:
-        return dict(cached_fields)
-
-    try:
-        fields = query_buffer_create_post_input_fields(settings=settings)
-    except Exception as exc:
-        print(f"warning: Buffer CreatePostInput schema probe failed; using postType fallback: {exc}", file=sys.stderr)
-        fallback_fields = {"postType": "reel"}
-        save_buffer_instagram_reel_input_fields(fallback_fields, settings=settings, source="fallback")
-        return fallback_fields
-
-    field_names = {field.get("name") for field in fields if field.get("name")}
-    for candidate in ("type", "postType", "post_type"):
-        if candidate in field_names:
-            reel_fields = {candidate: "reel"}
-            save_buffer_instagram_reel_input_fields(reel_fields, settings=settings, source="schema")
-            return reel_fields
-
-    print(
-        "warning: Buffer CreatePostInput schema did not expose a reel type field; using postType fallback.",
-        file=sys.stderr,
-    )
-    fallback_fields = {"postType": "reel"}
-    save_buffer_instagram_reel_input_fields(fallback_fields, settings=settings, source="fallback")
-    return fallback_fields
+    return {}
 
 
 def fetch_buffer_post(post_id, settings=None, *, error_fields=None):
