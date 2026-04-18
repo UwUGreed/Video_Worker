@@ -2138,88 +2138,89 @@ def post_reel_to_instagram_via_buffer(
     if existing_buffer_post_id:
         return accept_buffer_instagram_result(existing_result)
 
-    with temporary_buffer_video_url(target, settings=buffer) as hosted_video:
-        create_post_input = {
-            "text": instagram_caption,
-            "channelId": channel["id"],
-            "schedulingType": "automatic",
-            "mode": "shareNow",
-            "source": "video_worker_instagram_buffer",
-            "metadata": {
-                "instagram": {
-                    "type": "reel",
-                    "shouldShareToFeed": share_value,
-                }
-            },
-            "assets": {
-                "videos": [
-                    {
-                        "url": hosted_video["public_url"],
+    with sanitized_instagram_upload_file(target) as upload_target:
+        with temporary_buffer_video_url(upload_target, settings=buffer) as hosted_video:
+            create_post_input = {
+                "text": instagram_caption,
+                "channelId": channel["id"],
+                "schedulingType": "automatic",
+                "mode": "shareNow",
+                "source": "video_worker_instagram_buffer",
+                "metadata": {
+                    "instagram": {
+                        "type": "reel",
+                        "shouldShareToFeed": share_value,
                     }
-                ]
-            },
-        }
-        create_post_input.update(buffer_instagram_reel_input_fields(settings=buffer))
-        created = buffer_graphql(
-            buffer,
-            """
-            mutation CreatePost($input: CreatePostInput!) {
-              createPost(input: $input) {
-                __typename
-                ... on PostActionSuccess {
-                  post {
-                    id
-                    status
-                    text
-                    shareMode
-                    schedulingType
-                    sharedNow
-                    assets {
-                      id
-                      mimeType
-                      source
+                },
+                "assets": {
+                    "videos": [
+                        {
+                            "url": hosted_video["public_url"],
+                        }
+                    ]
+                },
+            }
+            create_post_input.update(buffer_instagram_reel_input_fields(settings=buffer))
+            created = buffer_graphql(
+                buffer,
+                """
+                mutation CreatePost($input: CreatePostInput!) {
+                  createPost(input: $input) {
+                    __typename
+                    ... on PostActionSuccess {
+                      post {
+                        id
+                        status
+                        text
+                        shareMode
+                        schedulingType
+                        sharedNow
+                        assets {
+                          id
+                          mimeType
+                          source
+                        }
+                      }
+                    }
+                    ... on MutationError {
+                      message
                     }
                   }
                 }
-                ... on MutationError {
-                  message
-                }
-              }
-            }
-            """,
-            variables={
-                "input": create_post_input,
-            },
-            default_message="Buffer Instagram createPost failed.",
-        ).get("createPost") or {}
+                """,
+                variables={
+                    "input": create_post_input,
+                },
+                default_message="Buffer Instagram createPost failed.",
+            ).get("createPost") or {}
 
-        if created.get("__typename") != "PostActionSuccess":
-            message = (created.get("message") or "Buffer Instagram createPost failed.").strip()
-            raise RuntimeError(message)
+            if created.get("__typename") != "PostActionSuccess":
+                message = (created.get("message") or "Buffer Instagram createPost failed.").strip()
+                raise RuntimeError(message)
 
-        post_snapshot = created.get("post") or {}
-        print(
-            "Buffer Instagram createPost asset snapshot: "
-            f"{json.dumps(post_snapshot.get('assets') or [], sort_keys=True, default=str)}",
-            file=sys.stderr,
-        )
-        accepted_result = accept_buffer_instagram_result(
-            build_buffer_instagram_result(
-                post_snapshot,
-                channel,
-                target,
-                instagram_caption,
-                hosted_video_url=hosted_video["public_url"],
+            post_snapshot = created.get("post") or {}
+            print(
+                "Buffer Instagram createPost asset snapshot: "
+                f"{json.dumps(post_snapshot.get('assets') or [], sort_keys=True, default=str)}",
+                file=sys.stderr,
             )
-        )
-        accepted_result["share_to_feed"] = share_value
-        if progress_callback and accepted_result:
-            progress_callback(accepted_result)
+            accepted_result = accept_buffer_instagram_result(
+                build_buffer_instagram_result(
+                    post_snapshot,
+                    channel,
+                    target,
+                    instagram_caption,
+                    hosted_video_url=hosted_video["public_url"],
+                )
+            )
+            accepted_result["share_to_feed"] = share_value
+            if progress_callback and accepted_result:
+                progress_callback(accepted_result)
 
-        hold_seconds = int(buffer.get("tunnel_hold_seconds") or 0)
-        hold_buffer_tunnel_for_fetch("Instagram", hosted_video, hold_seconds)
+            hold_seconds = int(buffer.get("tunnel_hold_seconds") or 0)
+            hold_buffer_tunnel_for_fetch("Instagram", hosted_video, hold_seconds)
 
-        return accepted_result
+            return accepted_result
 
 
 def post_reel_to_instagram(
