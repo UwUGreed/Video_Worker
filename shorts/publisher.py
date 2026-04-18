@@ -101,7 +101,7 @@ DEFAULT_QUICK_TUNNEL_MIN_INTERVAL_SECONDS = 30
 DEFAULT_QUICK_TUNNEL_MAX_ATTEMPTS = 2
 DEFAULT_QUICK_TUNNEL_RETRY_DELAY_SECONDS = 45
 DEFAULT_QUICK_TUNNEL_DOH_URL = "https://1.1.1.1/dns-query"
-DEFAULT_QUICK_TUNNEL_SETTLE_SECONDS = 15
+DEFAULT_QUICK_TUNNEL_SETTLE_SECONDS = 30
 DEFAULT_INSTAGRAM_CTA_TEXT = "Dont forget to Like and follow"
 DEFAULT_SHORTFORM_DESCRIPTION_TEXT = "3chan-style greentext story short."
 DEFAULT_SHORTFORM_HASHTAGS = ["#shorts", "#greentext", "#storytime"]
@@ -109,6 +109,7 @@ DEFAULT_BUFFER_API_URL = "https://api.buffer.com"
 DEFAULT_BUFFER_CLOUDFLARED_BIN = "cloudflared"
 DEFAULT_BUFFER_QUICK_TUNNEL_TIMEOUT_SECONDS = DEFAULT_INSTAGRAM_QUICK_TUNNEL_TIMEOUT_SECONDS
 DEFAULT_BUFFER_QUICK_TUNNEL_GRACE_SECONDS = DEFAULT_INSTAGRAM_QUICK_TUNNEL_GRACE_SECONDS
+DEFAULT_BUFFER_QUICK_TUNNEL_SETTLE_SECONDS = 15
 DEFAULT_BUFFER_TUNNEL_HOLD_SECONDS = 300
 DEFAULT_TIKTOK_PUBLISH_BACKEND = "native"
 DEFAULT_TIKTOK_POLL_SECONDS = 5
@@ -1266,6 +1267,22 @@ def get_instagram_container_status(container_id, settings=None):
     }
 
 
+def get_instagram_container_status_details(container_id, settings=None):
+    settings = settings or instagram_settings()
+    url = f"https://{settings['graph_host']}/{settings['api_version']}/{container_id}"
+    data = http_json(
+        "GET",
+        url,
+        headers=instagram_graph_headers(),
+        params=instagram_graph_params(
+            settings,
+            {"fields": "status_code,status,video_status,error_type,error_message"},
+        ),
+    )
+    raise_instagram_error(data, "Instagram container extended status lookup failed.")
+    return data
+
+
 def wait_for_instagram_container(container_id, settings=None):
     settings = settings or instagram_settings()
     deadline = time.time() + settings["poll_timeout_seconds"]
@@ -1278,9 +1295,15 @@ def wait_for_instagram_container(container_id, settings=None):
         if status_code == "FINISHED":
             return snapshot
         if status_code in {"ERROR", "EXPIRED"}:
+            detail_snapshot = None
+            try:
+                detail_snapshot = get_instagram_container_status_details(container_id, settings=settings)
+            except Exception:
+                detail_snapshot = None
             raise RuntimeError(
                 f"Instagram container {container_id} failed with status {status_code}. "
-                f"Snapshot: {json.dumps(snapshot['raw'], sort_keys=True)}"
+                f"Snapshot: {json.dumps(snapshot['raw'], sort_keys=True)}. "
+                f"Detail: {json.dumps(detail_snapshot or snapshot['raw'], sort_keys=True)}"
             )
         time.sleep(settings["poll_seconds"])
 
@@ -2088,7 +2111,7 @@ def buffer_settings():
         ).strip(),
         "quick_tunnel_settle_seconds": env_int(
             "BUFFER_QUICK_TUNNEL_SETTLE_SECONDS",
-            DEFAULT_QUICK_TUNNEL_SETTLE_SECONDS,
+            DEFAULT_BUFFER_QUICK_TUNNEL_SETTLE_SECONDS,
             minimum=0,
         ),
         "tunnel_hold_seconds": env_int(
@@ -2522,6 +2545,34 @@ def sanitized_instagram_upload_file(file_path):
     if not ffmpeg_bin:
         raise RuntimeError("ffmpeg is required to prepare Instagram uploads.")
 
+    ffprobe_bin = shutil.which("ffprobe")
+    if not ffprobe_bin:
+        raise RuntimeError("ffprobe is required to prepare Instagram uploads.")
+
+    probe_result = subprocess.run(
+        [
+            ffprobe_bin,
+            "-v",
+            "error",
+            "-select_streams",
+            "a",
+            "-show_entries",
+            "stream=index",
+            "-of",
+            "json",
+            str(target),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if probe_result.returncode != 0:
+        raise RuntimeError(f"Instagram upload audio probe failed: {probe_result.stderr[-500:]}")
+    try:
+        probe_payload = json.loads(probe_result.stdout or "{}")
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Instagram upload audio probe returned invalid JSON.") from exc
+    has_audio_streams = bool((probe_payload.get("streams") or []))
+
     with tempfile.NamedTemporaryFile(prefix="instagram-upload-", suffix=".mp4", delete=False) as handle:
         sanitized_path = Path(handle.name)
 
@@ -2530,36 +2581,61 @@ def sanitized_instagram_upload_file(file_path):
         "-y",
         "-i",
         str(target),
-        "-map",
-        "0:v:0",
-        "-map",
-        "0:a:0?",
-        "-sn",
-        "-dn",
-        "-map_metadata",
-        "-1",
-        "-c:v",
-        "libx264",
-        "-preset",
-        "veryfast",
-        "-pix_fmt",
-        "yuv420p",
-        "-profile:v",
-        "high",
-        "-level:v",
-        "4.1",
-        "-movflags",
-        "+faststart",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "128k",
-        "-ar",
-        "48000",
-        "-ac",
-        "2",
-        str(sanitized_path),
     ]
+    if has_audio_streams:
+        cmd.extend(
+            [
+                "-map",
+                "0:v:0",
+                "-map",
+                "0:a:0",
+            ]
+        )
+    else:
+        cmd.extend(
+            [
+                "-f",
+                "lavfi",
+                "-i",
+                "anullsrc=channel_layout=stereo:sample_rate=48000",
+                "-map",
+                "0:v:0",
+                "-map",
+                "1:a:0",
+            ]
+        )
+    cmd.extend(
+        [
+            "-sn",
+            "-dn",
+            "-map_metadata",
+            "-1",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-pix_fmt",
+            "yuv420p",
+            "-profile:v",
+            "high",
+            "-level:v",
+            "4.1",
+            "-movflags",
+            "+faststart",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            "-ar",
+            "48000",
+            "-ac",
+            "2",
+        ]
+    )
+    if not has_audio_streams:
+        cmd.append("-shortest")
+    cmd.append(str(sanitized_path))
+
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         try:

@@ -384,6 +384,11 @@ async def render(
             "-map", "0:v:0",
             "-map", "[aout]",
         ])
+    else:
+        mux_cmd.extend([
+            "-map", "0:v:0",
+            "-map", "1:a:0",
+        ])
 
     mux_cmd.extend([
         "-c:v", encoder_settings["codec"],
