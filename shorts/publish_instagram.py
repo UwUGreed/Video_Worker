@@ -10,16 +10,21 @@ REPO_DIR = os.path.dirname(SCRIPT_DIR)
 if REPO_DIR not in sys.path:
     sys.path.insert(0, REPO_DIR)
 
-from shorts.publisher import post_reel_to_instagram
+from shorts.publisher import check_instagram_token_valid, instagram_settings, post_reel_to_instagram
 
 
 def main():
     parser = argparse.ArgumentParser(description="Post a local mp4 to Instagram as a Reel.")
-    parser.add_argument("--file", required=True, help="Path to the local mp4 file to publish.")
+    parser.add_argument("--file", help="Path to the local mp4 file to publish.")
     parser.add_argument("--caption", default="", help="Caption to publish with the Reel.")
     parser.add_argument("--thumb-offset-ms", type=int, help="Frame timestamp in milliseconds for the cover.")
     parser.add_argument("--cover-url", default="", help="Optional public JPEG URL for the Reel cover image.")
     parser.add_argument("--audio-name", default="", help="Optional original-audio display name.")
+    parser.add_argument(
+        "--check-token",
+        action="store_true",
+        help="Validate the configured Instagram access token and exit without publishing.",
+    )
     parser.add_argument(
         "--reels-only",
         action="store_true",
@@ -36,6 +41,23 @@ def main():
         help="Use the older Meta resumable upload flow instead of the default quick-tunnel video_url flow.",
     )
     args = parser.parse_args()
+
+    if args.check_token:
+        settings = instagram_settings()
+        if args.resumable_upload and not (os.environ.get("INSTAGRAM_GRAPH_HOST") or "").strip():
+            settings = dict(settings)
+            settings["publish_method"] = "resumable"
+            settings["graph_host"] = "graph.facebook.com"
+        try:
+            result = check_instagram_token_valid(settings)
+        except RuntimeError as exc:
+            print(json.dumps({"status": "error", "message": str(exc)}, indent=2))
+            raise SystemExit(1)
+        print(json.dumps(result, indent=2))
+        return
+
+    if not args.file:
+        parser.error("--file is required unless --check-token is used.")
 
     result = post_reel_to_instagram(
         args.file,

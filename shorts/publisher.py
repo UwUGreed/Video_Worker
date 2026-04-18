@@ -9,6 +9,7 @@ import queue
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -1283,6 +1284,62 @@ def get_instagram_container_status_details(container_id, settings=None):
     return data
 
 
+def check_instagram_token_valid(settings):
+    url = f"https://{settings['graph_host']}/{settings['api_version']}/me"
+    requests = require_requests()
+    try:
+        response = requests.get(
+            url,
+            headers=instagram_graph_headers(),
+            params=instagram_graph_params(settings, {"fields": "id,name"}),
+            timeout=30,
+        )
+    except Exception as exc:
+        warning = f"Instagram token health check skipped: {exc}"
+        print(f"warning: {warning}", file=sys.stderr)
+        return {
+            "status": "warning",
+            "warning": warning,
+            "graph_host": settings["graph_host"],
+            "api_version": settings["api_version"],
+        }
+
+    data = {}
+    if response.content:
+        try:
+            data = response.json()
+        except ValueError:
+            data = {}
+    error = (data or {}).get("error") or {}
+    error_code = error.get("code")
+
+    if 400 <= response.status_code < 500 or error_code == 190:
+        raise RuntimeError(
+            "Instagram access token is invalid or expired "
+            f"(code={error_code or 190}). Refresh your long-lived token and update "
+            "INSTAGRAM_ACCESS_TOKEN in shorts/instagram.env before retrying."
+        )
+
+    if response.status_code >= 500 or error:
+        detail = error.get("message") or response.text.strip()[:300] or f"HTTP {response.status_code}"
+        warning = f"Instagram token health check skipped: {detail}"
+        print(f"warning: {warning}", file=sys.stderr)
+        return {
+            "status": "warning",
+            "warning": warning,
+            "graph_host": settings["graph_host"],
+            "api_version": settings["api_version"],
+        }
+
+    return {
+        "status": "ok",
+        "graph_host": settings["graph_host"],
+        "api_version": settings["api_version"],
+        "id": data.get("id"),
+        "name": data.get("name"),
+    }
+
+
 def wait_for_instagram_container(container_id, settings=None):
     settings = settings or instagram_settings()
     deadline = time.time() + settings["poll_timeout_seconds"]
@@ -1311,6 +1368,60 @@ def wait_for_instagram_container(container_id, settings=None):
     raise RuntimeError(
         f"Timed out waiting for Instagram container {container_id} to finish. Last status: {last_code}."
     )
+
+
+def probe_media_file(path, *, ffprobe_bin=None):
+    ffprobe_bin = ffprobe_bin or shutil.which("ffprobe")
+    if not ffprobe_bin:
+        raise RuntimeError("ffprobe is required to inspect Instagram uploads.")
+    result = subprocess.run(
+        [
+            ffprobe_bin,
+            "-v",
+            "error",
+            "-show_streams",
+            "-show_format",
+            "-of",
+            "json",
+            str(path),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"Instagram upload probe failed: {result.stderr[-500:]}")
+    try:
+        return json.loads(result.stdout or "{}")
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Instagram upload probe returned invalid JSON.") from exc
+
+
+def ffprobe_rate_to_fps(rate):
+    raw = (rate or "").strip()
+    if not raw or raw in {"0/0", "N/A"}:
+        return 0.0
+    if "/" in raw:
+        numerator, denominator = raw.split("/", 1)
+        try:
+            denominator_value = float(denominator)
+            if denominator_value == 0:
+                return 0.0
+            return float(numerator) / denominator_value
+        except ValueError:
+            return 0.0
+    try:
+        return float(raw)
+    except ValueError:
+        return 0.0
+
+
+def format_debug_fps(fps):
+    if fps <= 0:
+        return "unknown"
+    rounded = round(fps)
+    if abs(fps - rounded) < 0.05:
+        return str(int(rounded))
+    return f"{fps:.2f}".rstrip("0").rstrip(".")
 
 
 def fetch_instagram_media_details(media_id, settings=None):
@@ -1878,6 +1989,7 @@ def post_reel_to_instagram(
     settings["publish_method"] = method
     if not (os.environ.get("INSTAGRAM_GRAPH_HOST") or "").strip():
         settings["graph_host"] = "graph.instagram.com" if method == "quick_tunnel" else "graph.facebook.com"
+    check_instagram_token_valid(settings)
     instagram_caption = build_instagram_caption(caption, settings=settings)
     share_value = settings["share_to_feed"] if share_to_feed is None else bool(share_to_feed)
     if method == "quick_tunnel" and not wait_for_finish:
@@ -2549,29 +2661,16 @@ def sanitized_instagram_upload_file(file_path):
     if not ffprobe_bin:
         raise RuntimeError("ffprobe is required to prepare Instagram uploads.")
 
-    probe_result = subprocess.run(
-        [
-            ffprobe_bin,
-            "-v",
-            "error",
-            "-select_streams",
-            "a",
-            "-show_entries",
-            "stream=index",
-            "-of",
-            "json",
-            str(target),
-        ],
-        capture_output=True,
-        text=True,
-    )
-    if probe_result.returncode != 0:
-        raise RuntimeError(f"Instagram upload audio probe failed: {probe_result.stderr[-500:]}")
+    probe_payload = probe_media_file(target, ffprobe_bin=ffprobe_bin)
+    streams = probe_payload.get("streams") or []
+    format_data = probe_payload.get("format") or {}
+    has_audio_streams = any((stream.get("codec_type") or "").strip() == "audio" for stream in streams)
     try:
-        probe_payload = json.loads(probe_result.stdout or "{}")
-    except json.JSONDecodeError as exc:
-        raise RuntimeError("Instagram upload audio probe returned invalid JSON.") from exc
-    has_audio_streams = bool((probe_payload.get("streams") or []))
+        duration_seconds = float(format_data.get("duration") or 0.0)
+    except (TypeError, ValueError):
+        duration_seconds = 0.0
+    if duration_seconds < 5.0:
+        raise RuntimeError(f"Instagram Reels require a minimum of 5 seconds. This clip is {duration_seconds:.1f}s.")
 
     with tempfile.NamedTemporaryFile(prefix="instagram-upload-", suffix=".mp4", delete=False) as handle:
         sanitized_path = Path(handle.name)
@@ -2610,6 +2709,14 @@ def sanitized_instagram_upload_file(file_path):
             "-dn",
             "-map_metadata",
             "-1",
+            "-r",
+            "30",
+            "-g",
+            "60",
+            "-keyint_min",
+            "30",
+            "-sc_threshold",
+            "0",
             "-c:v",
             "libx264",
             "-preset",
@@ -2645,6 +2752,27 @@ def sanitized_instagram_upload_file(file_path):
         raise RuntimeError(f"Instagram upload sanitization failed: {result.stderr[-500:]}")
 
     try:
+        sanitized_probe = probe_media_file(sanitized_path, ffprobe_bin=ffprobe_bin)
+        sanitized_streams = sanitized_probe.get("streams") or []
+        sanitized_video_stream = next(
+            ((stream or {}) for stream in sanitized_streams if (stream.get("codec_type") or "").strip() == "video"),
+            {},
+        )
+        sanitized_has_audio = any(
+            (stream.get("codec_type") or "").strip() == "audio" for stream in sanitized_streams
+        )
+        sanitized_size_mb = sanitized_path.stat().st_size / (1024 * 1024)
+        sanitized_fps = ffprobe_rate_to_fps(
+            sanitized_video_stream.get("avg_frame_rate") or sanitized_video_stream.get("r_frame_rate") or ""
+        )
+        print(
+            "instagram sanitized: "
+            f"codec={sanitized_video_stream.get('codec_name') or 'unknown'} "
+            f"fps={format_debug_fps(sanitized_fps)} "
+            f"res={sanitized_video_stream.get('width') or 0}x{sanitized_video_stream.get('height') or 0} "
+            f"audio={sanitized_has_audio} "
+            f"size={sanitized_size_mb:.1f}MB"
+        )
         yield sanitized_path
     finally:
         try:
