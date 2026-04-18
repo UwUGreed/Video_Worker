@@ -2119,6 +2119,7 @@ def post_reel_to_instagram_via_buffer(
             "metadata": {
                 "instagram": {
                     "type": "reel",
+                    "shouldShareToFeed": share_value,
                 }
             },
             "assets": {
