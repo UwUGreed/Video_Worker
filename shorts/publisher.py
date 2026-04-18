@@ -1708,7 +1708,11 @@ def post_reel_to_instagram(
 
 
 def tiktok_settings():
-    publish_backend = normalize_tiktok_publish_backend(os.environ.get("TIKTOK_PUBLISH_BACKEND"))
+    raw_backend = (os.environ.get("TIKTOK_PUBLISH_BACKEND") or "").strip()
+    buffer_api_key = (os.environ.get("BUFFER_API_KEY") or "").strip()
+    publish_backend = normalize_tiktok_publish_backend(raw_backend)
+    if not raw_backend and buffer_api_key:
+        publish_backend = "buffer"
     access_token = (os.environ.get("TIKTOK_ACCESS_TOKEN") or "").strip()
     raw_description_text = os.environ.get("TIKTOK_DESCRIPTION_TEXT")
     if publish_backend != "buffer" and not access_token:
