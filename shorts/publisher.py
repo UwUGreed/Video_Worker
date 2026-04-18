@@ -2116,6 +2116,11 @@ def post_reel_to_instagram_via_buffer(
             "schedulingType": "automatic",
             "mode": "shareNow",
             "source": "video_worker_instagram_buffer",
+            "metadata": {
+                "instagram": {
+                    "type": "reel",
+                }
+            },
             "assets": {
                 "videos": [
                     {
