@@ -1817,45 +1817,43 @@ def temporary_instagram_video_url(file_path, settings=None):
     max_attempts = max(int(settings.get("quick_tunnel_max_attempts") or 1), 1)
     retry_delay_seconds = max(int(settings.get("quick_tunnel_retry_delay_seconds") or 1), 1)
     last_error = None
-    hosted_video = None
-    active_stack = None
 
-    with serve_file_over_http(file_path) as local_server:
-        for attempt in range(1, max_attempts + 1):
-            try:
-                with ExitStack() as stack:
-                    tunnel = stack.enter_context(cloudflare_quick_tunnel(local_server["local_url"], settings=settings))
-                    public_url = f"{tunnel['public_origin']}{local_server['route']}"
-                    settle_seconds = max(int(settings.get("quick_tunnel_settle_seconds") or 0), 0)
-                    if settle_seconds > 0:
-                        time.sleep(settle_seconds)
-                    probe = wait_for_public_video_url(
-                        public_url,
-                        timeout_seconds=max(settings["quick_tunnel_grace_seconds"], 0),
-                        required=True,
-                        doh_url=(settings.get("quick_tunnel_doh_url") or "").strip(),
-                    )
-                    hosted_video = {
-                        "local_url": local_server["local_url"],
-                        "public_origin": tunnel["public_origin"],
-                        "public_url": public_url,
-                        "probe": probe,
-                    }
-                    active_stack = stack.pop_all()
-                    break
-            except Exception as exc:
-                last_error = exc
-                if attempt >= max_attempts:
-                    break
-                time.sleep(retry_delay_seconds * attempt)
+    for attempt in range(1, max_attempts + 1):
+        active_stack = ExitStack()
+        try:
+            local_server = active_stack.enter_context(serve_file_over_http(file_path))
+            tunnel = active_stack.enter_context(cloudflare_quick_tunnel(local_server["local_url"], settings=settings))
+            public_url = f"{tunnel['public_origin']}{local_server['route']}"
+            settle_seconds = max(int(settings.get("quick_tunnel_settle_seconds") or 0), 0)
+            if settle_seconds > 0:
+                time.sleep(settle_seconds)
+            probe = wait_for_public_video_url(
+                public_url,
+                timeout_seconds=max(settings["quick_tunnel_grace_seconds"], 0),
+                required=True,
+                doh_url=(settings.get("quick_tunnel_doh_url") or "").strip(),
+            )
+            hosted_video = {
+                "local_url": local_server["local_url"],
+                "public_origin": tunnel["public_origin"],
+                "public_url": public_url,
+                "probe": probe,
+            }
+        except Exception as exc:
+            active_stack.close()
+            last_error = exc
+            if attempt >= max_attempts:
+                break
+            time.sleep(retry_delay_seconds * attempt)
+            continue
 
-    if active_stack is None or hosted_video is None:
-        raise RuntimeError(
-            f"Cloudflare quick tunnel failed after {max_attempts} attempts. Last error: {last_error}"
-        ) from last_error
+        with active_stack:
+            yield hosted_video
+        return
 
-    with active_stack:
-        yield hosted_video
+    raise RuntimeError(
+        f"Cloudflare quick tunnel failed after {max_attempts} attempts. Last error: {last_error}"
+    ) from last_error
 
 
 def build_instagram_reel_payload(
