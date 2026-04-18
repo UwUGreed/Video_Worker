@@ -2175,6 +2175,8 @@ def post_reel_to_instagram_via_buffer(
                     schedulingType
                     sharedNow
                     assets {
+                      id
+                      mimeType
                       source
                     }
                   }
@@ -2196,6 +2198,11 @@ def post_reel_to_instagram_via_buffer(
             raise RuntimeError(message)
 
         post_snapshot = created.get("post") or {}
+        print(
+            "Buffer Instagram createPost asset snapshot: "
+            f"{json.dumps(post_snapshot.get('assets') or [], sort_keys=True, default=str)}",
+            file=sys.stderr,
+        )
         accepted_result = accept_buffer_instagram_result(
             build_buffer_instagram_result(
                 post_snapshot,
