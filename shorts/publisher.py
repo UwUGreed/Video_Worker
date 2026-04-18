@@ -2204,6 +2204,15 @@ def post_reel_to_instagram_via_buffer(
                 f"{json.dumps(post_snapshot.get('assets') or [], sort_keys=True, default=str)}",
                 file=sys.stderr,
             )
+            print(
+                "Buffer Instagram createPost state: "
+                f"id={post_snapshot.get('id') or ''} "
+                f"status={post_snapshot.get('status') or ''} "
+                f"shareMode={post_snapshot.get('shareMode') or ''} "
+                f"schedulingType={post_snapshot.get('schedulingType') or ''} "
+                f"sharedNow={post_snapshot.get('sharedNow')}",
+                file=sys.stderr,
+            )
             accepted_result = accept_buffer_instagram_result(
                 build_buffer_instagram_result(
                     post_snapshot,
