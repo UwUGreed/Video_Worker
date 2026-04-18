@@ -2175,7 +2175,6 @@ def post_reel_to_instagram_via_buffer(
                         shareMode
                         schedulingType
                         sharedNow
-                        sentAt
                         assets {
                           id
                           mimeType
@@ -2201,8 +2200,8 @@ def post_reel_to_instagram_via_buffer(
 
             post_snapshot = created.get("post") or {}
             print(
-                "Buffer Instagram createPost snapshot: "
-                f"{json.dumps(post_snapshot, sort_keys=True, default=str)}",
+                "Buffer Instagram createPost asset snapshot: "
+                f"{json.dumps(post_snapshot.get('assets') or [], sort_keys=True, default=str)}",
                 file=sys.stderr,
             )
             accepted_result = accept_buffer_instagram_result(
