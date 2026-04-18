@@ -2245,6 +2245,15 @@ def post_reel_to_instagram_via_buffer(
                 f"sharedNow={post_snapshot.get('sharedNow')}",
                 file=sys.stderr,
             )
+            post_status = (post_snapshot.get("status") or "").strip().lower()
+            if post_status == "error" or post_snapshot.get("sharedNow") is False:
+                raise RuntimeError(
+                    "Buffer Instagram createPost returned a failed post: "
+                    f"id={post_snapshot.get('id') or ''} "
+                    f"status={post_snapshot.get('status') or ''} "
+                    f"sharedNow={post_snapshot.get('sharedNow')} "
+                    f"assets={json.dumps(post_snapshot.get('assets') or [], sort_keys=True, default=str)}"
+                )
             accepted_result = accept_buffer_instagram_result(
                 build_buffer_instagram_result(
                     post_snapshot,
