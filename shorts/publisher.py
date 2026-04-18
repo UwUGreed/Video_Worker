@@ -101,6 +101,7 @@ DEFAULT_QUICK_TUNNEL_MIN_INTERVAL_SECONDS = 30
 DEFAULT_QUICK_TUNNEL_MAX_ATTEMPTS = 2
 DEFAULT_QUICK_TUNNEL_RETRY_DELAY_SECONDS = 45
 DEFAULT_QUICK_TUNNEL_DOH_URL = "https://1.1.1.1/dns-query"
+DEFAULT_QUICK_TUNNEL_SETTLE_SECONDS = 15
 DEFAULT_INSTAGRAM_CTA_TEXT = "Dont forget to Like and follow"
 DEFAULT_SHORTFORM_DESCRIPTION_TEXT = "3chan-style greentext story short."
 DEFAULT_SHORTFORM_HASHTAGS = ["#shorts", "#greentext", "#storytime"]
@@ -1241,6 +1242,11 @@ def instagram_settings():
         "quick_tunnel_doh_url": (
             os.environ.get("INSTAGRAM_QUICK_TUNNEL_DOH_URL") or DEFAULT_QUICK_TUNNEL_DOH_URL
         ).strip(),
+        "quick_tunnel_settle_seconds": env_int(
+            "INSTAGRAM_QUICK_TUNNEL_SETTLE_SECONDS",
+            DEFAULT_QUICK_TUNNEL_SETTLE_SECONDS,
+            minimum=0,
+        ),
     }
 
 
@@ -1570,6 +1576,9 @@ def temporary_instagram_video_url(file_path, settings=None):
             try:
                 with cloudflare_quick_tunnel(local_server["local_url"], settings=settings) as tunnel:
                     public_url = f"{tunnel['public_origin']}{local_server['route']}"
+                    settle_seconds = max(int(settings.get("quick_tunnel_settle_seconds") or 0), 0)
+                    if settle_seconds > 0:
+                        time.sleep(settle_seconds)
                     probe = wait_for_public_video_url(
                         public_url,
                         timeout_seconds=max(settings["quick_tunnel_grace_seconds"], 0),
@@ -1730,6 +1739,19 @@ def wait_for_public_video_url(url, timeout_seconds=20, *, required=True, doh_url
     last_error = ""
 
     while time.time() <= deadline:
+        curl_probe = probe_public_video_url_with_curl(url)
+        if curl_probe.get("reachable"):
+            return curl_probe
+        last_error = f"{curl_probe.get('method')}: {curl_probe.get('last_error')}"
+
+        if doh_url:
+            curl_doh_probe = probe_public_video_url_with_curl(url, doh_url=doh_url)
+            if curl_doh_probe.get("reachable"):
+                return curl_doh_probe
+            last_error = (
+                f"{last_error}; {curl_doh_probe.get('method')}: {curl_doh_probe.get('last_error')}"
+            )
+
         try:
             response = requests.get(
                 url,
@@ -1746,13 +1768,6 @@ def wait_for_public_video_url(url, timeout_seconds=20, *, required=True, doh_url
             last_error = f"HTTP {response.status_code}"
         except requests.RequestException as exc:
             last_error = str(exc)
-            if doh_url and ("NameResolutionError" in last_error or "Failed to resolve" in last_error):
-                curl_probe = probe_public_video_url_with_curl(url, doh_url=doh_url)
-                if curl_probe.get("reachable"):
-                    return curl_probe
-                last_error = (
-                    f"{last_error}; fallback {curl_probe.get('method')}: {curl_probe.get('last_error')}"
-                )
         time.sleep(1)
 
     if required:
@@ -2057,6 +2072,14 @@ def buffer_settings():
             "BUFFER_QUICK_TUNNEL_RETRY_DELAY_SECONDS",
             DEFAULT_QUICK_TUNNEL_RETRY_DELAY_SECONDS,
             minimum=1,
+        ),
+        "quick_tunnel_doh_url": (
+            os.environ.get("BUFFER_QUICK_TUNNEL_DOH_URL") or DEFAULT_QUICK_TUNNEL_DOH_URL
+        ).strip(),
+        "quick_tunnel_settle_seconds": env_int(
+            "BUFFER_QUICK_TUNNEL_SETTLE_SECONDS",
+            DEFAULT_QUICK_TUNNEL_SETTLE_SECONDS,
+            minimum=0,
         ),
         "tunnel_hold_seconds": env_int(
             "BUFFER_TUNNEL_HOLD_SECONDS",
