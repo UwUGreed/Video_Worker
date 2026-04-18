@@ -657,7 +657,7 @@ def should_finalize_queue_entry_after_social_failures(active_platforms, platform
 
 def post_reserved_queue_entry_to_platforms(entry, *, interactive_auth=False, platform_targets=None):
     platform_targets = dict(platform_targets or queue_platform_targets())
-    active_platforms = [name for name in ("youtube", "instagram", "tiktok") if platform_targets.get(name)]
+    active_platforms = [name for name in ("youtube", "tiktok", "instagram") if platform_targets.get(name)]
     if not active_platforms:
         raise RuntimeError("No enabled platforms were selected for this queued short.")
 
@@ -3175,8 +3175,6 @@ def sanitized_instagram_upload_file(file_path):
             "-dn",
             "-map_metadata",
             "-1",
-            "-vf",
-            "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2,setsar=1",
             "-r",
             "30",
             "-g",
@@ -3195,16 +3193,8 @@ def sanitized_instagram_upload_file(file_path):
             "high",
             "-level:v",
             "4.1",
-            "-b:v",
-            "8000k",
-            "-maxrate",
-            "8000k",
-            "-bufsize",
-            "16000k",
             "-movflags",
             "+faststart",
-            "-video_track_timescale",
-            "30000",
             "-c:a",
             "aac",
             "-b:a",
