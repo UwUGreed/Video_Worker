@@ -401,14 +401,19 @@ def update_queue_entry(queue_id, updater):
             save_queue_unlocked(queue)
 
 
-def mark_posted(queue_id, youtube_video_id, youtube_url, file_cleanup=None):
+def mark_posted(queue_id, youtube_video_id=None, youtube_url=None, file_cleanup=None, platform_results=None):
     file_cleanup = file_cleanup or {}
+    platform_results = dict(platform_results or {})
 
     def updater(item):
         item["status"] = "posted"
         item["posted_at"] = now_utc_iso()
-        item["youtube_video_id"] = youtube_video_id
-        item["youtube_url"] = youtube_url
+        if youtube_video_id is not None:
+            item["youtube_video_id"] = youtube_video_id
+        if youtube_url is not None:
+            item["youtube_url"] = youtube_url
+        for platform, result in platform_results.items():
+            apply_queue_entry_platform_result(item, platform, result)
         item["last_error"] = None
         item["local_file_deleted"] = bool(file_cleanup.get("deleted"))
         item["local_file_deleted_at"] = now_utc_iso() if file_cleanup.get("deleted") else None
@@ -431,6 +436,17 @@ def release_reserved(queue_id):
         item["status"] = "pending"
 
     update_queue_entry(queue_id, updater)
+
+
+def delete_queue_entry(queue_id):
+    with queue_lock():
+        queue = load_queue_unlocked()
+        original_count = len(queue)
+        queue = [item for item in queue if item.get("queue_id") != queue_id]
+        if len(queue) == original_count:
+            return False
+        save_queue_unlocked(queue)
+    return True
 
 
 def _split_env_list(name, default_values):
@@ -462,6 +478,126 @@ def build_entry_payload(entry):
         "tags": tags,
         "privacy_status": (os.environ.get("YOUTUBE_PRIVACY_STATUS") or "public").strip() or "public",
         "category_id": (os.environ.get("YOUTUBE_CATEGORY_ID") or "24").strip() or "24",
+    }
+
+
+def queue_platform_targets(force_all_platforms=False):
+    enable_all = force_all_platforms or env_bool("VIDEO_POST_TO_ALL_PLATFORMS", False)
+    targets = {
+        "youtube": env_bool("VIDEO_POST_TO_YOUTUBE", True),
+        "instagram": env_bool("VIDEO_POST_TO_INSTAGRAM", False),
+        "tiktok": env_bool("VIDEO_POST_TO_TIKTOK", False),
+    }
+    if enable_all:
+        targets["youtube"] = True
+        targets["instagram"] = True
+        targets["tiktok"] = True
+    if not any(targets.values()):
+        targets["youtube"] = True
+    return targets
+
+
+def build_queue_shortform_caption(entry):
+    headline = (entry.get("headline") or "").strip()
+    if headline:
+        return headline
+
+    title = (entry.get("title") or "").strip()
+    title_suffix = (os.environ.get("YOUTUBE_TITLE_SUFFIX") or "").strip()
+    if title_suffix and title.endswith(title_suffix):
+        title = title[: -len(title_suffix)].rstrip()
+    return title
+
+
+def queue_entry_platform_results(entry):
+    return dict(entry.get("platform_results") or {})
+
+
+def queue_entry_platform_completed(entry, platform):
+    platform_result = (queue_entry_platform_results(entry).get(platform) or {})
+    if platform_result.get("completed"):
+        return True
+    if platform == "youtube":
+        return bool(entry.get("youtube_video_id") or entry.get("youtube_url"))
+    if platform == "instagram":
+        return bool(entry.get("instagram_media_id") or entry.get("instagram_permalink"))
+    if platform == "tiktok":
+        return bool(entry.get("tiktok_publish_id") or entry.get("tiktok_public_post_ids"))
+    return False
+
+
+def apply_queue_entry_platform_result(item, platform, result):
+    completed_at = now_utc_iso()
+    platform_results = queue_entry_platform_results(item)
+    normalized_result = dict(result or {})
+    normalized_result["completed"] = True
+    normalized_result["completed_at"] = completed_at
+    platform_results[platform] = normalized_result
+    item["platform_results"] = platform_results
+
+    if platform == "youtube":
+        item["youtube_video_id"] = normalized_result.get("video_id")
+        item["youtube_url"] = normalized_result.get("youtube_url")
+    elif platform == "instagram":
+        item["instagram_media_id"] = normalized_result.get("media_id")
+        item["instagram_permalink"] = normalized_result.get("permalink")
+        item["instagram_shortcode"] = normalized_result.get("shortcode")
+    elif platform == "tiktok":
+        item["tiktok_publish_id"] = normalized_result.get("publish_id") or normalized_result.get("buffer_post_id")
+        item["tiktok_public_post_ids"] = normalized_result.get("public_post_ids") or []
+        item["tiktok_provider"] = normalized_result.get("provider")
+
+
+def persist_queue_entry_platform_result(queue_id, platform, result):
+    def updater(item):
+        apply_queue_entry_platform_result(item, platform, result)
+        item["last_error"] = None
+
+    update_queue_entry(queue_id, updater)
+
+
+def queue_platform_error_message(errors):
+    return "; ".join(f"{platform}: {message}" for platform, message in errors.items())
+
+
+def post_reserved_queue_entry_to_platforms(entry, *, interactive_auth=False, platform_targets=None):
+    platform_targets = dict(platform_targets or queue_platform_targets())
+    active_platforms = [name for name in ("youtube", "instagram", "tiktok") if platform_targets.get(name)]
+    if not active_platforms:
+        raise RuntimeError("No enabled platforms were selected for this queued short.")
+
+    caption = build_queue_shortform_caption(entry)
+    working_entry = dict(entry)
+    working_entry["platform_results"] = queue_entry_platform_results(entry)
+    completed_results = dict(working_entry["platform_results"])
+    errors = {}
+
+    for platform in active_platforms:
+        if queue_entry_platform_completed(working_entry, platform):
+            existing_result = (queue_entry_platform_results(working_entry).get(platform) or {})
+            if existing_result:
+                completed_results[platform] = existing_result
+            continue
+
+        try:
+            if platform == "youtube":
+                result = upload_short_to_youtube(working_entry, interactive=interactive_auth)
+            elif platform == "instagram":
+                result = post_reel_to_instagram(working_entry["file_path"], caption)
+            else:
+                result = post_video_to_tiktok(working_entry["file_path"], caption)
+        except Exception as exc:
+            errors[platform] = str(exc)
+            continue
+
+        completed_results[platform] = dict(result)
+        persist_queue_entry_platform_result(working_entry["queue_id"], platform, result)
+        apply_queue_entry_platform_result(working_entry, platform, result)
+
+    return {
+        "active_platforms": active_platforms,
+        "platform_results": completed_results,
+        "platform_errors": errors,
     }
 
 
@@ -744,7 +880,13 @@ def run_storage_maintenance():
     }
 
 
-def post_next_queued_short(dry_run=False, interactive_auth=False):
+def post_next_queued_short(
+    dry_run=False,
+    interactive_auth=False,
+    *,
+    force_all_platforms=False,
+    drop_from_queue_on_success=False,
+):
     ensure_layout()
     entry = reserve_next_short()
     if entry is None:
@@ -776,11 +918,16 @@ def post_next_queued_short(dry_run=False, interactive_auth=False):
             "file_path": entry["file_path"],
             "title": payload["title"],
             "description": payload["description"],
+            "platform_targets": queue_platform_targets(force_all_platforms=force_all_platforms),
             "cleanup": cleanup_summary,
         }
 
     try:
-        result = upload_short_to_youtube(entry, interactive=interactive_auth)
+        publish_result = post_reserved_queue_entry_to_platforms(
+            entry,
+            interactive_auth=interactive_auth,
+            platform_targets=queue_platform_targets(force_all_platforms=force_all_platforms),
+        )
     except Exception as exc:
         mark_failed(entry["queue_id"], str(exc))
         cleanup_summary = run_storage_maintenance()
@@ -791,20 +938,65 @@ def post_next_queued_short(dry_run=False, interactive_auth=False):
             "cleanup": cleanup_summary,
         }
 
+    platform_errors = publish_result["platform_errors"]
+    platform_results = publish_result["platform_results"]
+    active_platforms = publish_result["active_platforms"]
+    completed_platforms = [platform for platform in active_platforms if platform in platform_results]
+
+    if platform_errors or len(completed_platforms) != len(active_platforms):
+        message = queue_platform_error_message(platform_errors) or "One or more platform posts did not complete."
+        mark_failed(entry["queue_id"], message)
+        cleanup_summary = run_storage_maintenance()
+        return {
+            "status": "error",
+            "queue_id": entry["queue_id"],
+            "message": message,
+            "active_platforms": active_platforms,
+            "completed_platforms": completed_platforms,
+            "platform_results": platform_results,
+            "platform_errors": platform_errors,
+            "cleanup": cleanup_summary,
+        }
+
     file_cleanup = remove_posted_clip_file(entry["file_path"])
-    mark_posted(entry["queue_id"], result["video_id"], result["youtube_url"], file_cleanup=file_cleanup)
+    youtube_result = platform_results.get("youtube") or {}
+    mark_posted(
+        entry["queue_id"],
+        youtube_result.get("video_id"),
+        youtube_result.get("youtube_url"),
+        file_cleanup=file_cleanup,
+        platform_results=platform_results,
+    )
+    queue_deleted = delete_queue_entry(entry["queue_id"]) if drop_from_queue_on_success else False
     cleanup_summary = run_storage_maintenance()
     return {
         "status": "posted",
         "queue_id": entry["queue_id"],
-        "video_id": result["video_id"],
-        "youtube_url": result["youtube_url"],
-        "title": result["title"],
+        "video_id": youtube_result.get("video_id"),
+        "youtube_url": youtube_result.get("youtube_url"),
+        "title": youtube_result.get("title") or entry.get("title"),
         "file_path": entry["file_path"],
+        "active_platforms": active_platforms,
+        "platform_results": platform_results,
+        "queue_deleted": queue_deleted,
         "local_file_deleted": file_cleanup["deleted"],
         "local_file_delete_error": file_cleanup["error"],
         "cleanup": cleanup_summary,
     }
+
+
+def post_next_queued_short_to_all_platforms(
+    dry_run=False,
+    interactive_auth=False,
+    *,
+    delete_queue_entry_on_success=True,
+):
+    return post_next_queued_short(
+        dry_run=dry_run,
+        interactive_auth=interactive_auth,
+        force_all_platforms=True,
+        drop_from_queue_on_success=delete_queue_entry_on_success,
+    )
 
 
 def require_requests():
