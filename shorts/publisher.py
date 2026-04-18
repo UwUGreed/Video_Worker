@@ -1862,13 +1862,13 @@ def post_reel_to_instagram(
             "Quick tunnel publishing requires waiting for Meta processing so the temporary video URL stays online."
         )
 
-    def publish_from_payload(payload, *, hosted_video_url="", hosted_video_probe=None):
+    def publish_from_payload(payload, upload_target, *, hosted_video_url="", hosted_video_probe=None):
         create_response, container_id = create_instagram_media_container(payload, settings=settings)
 
         if method == "resumable":
             upload_instagram_reel_file(
                 container_id,
-                target,
+                upload_target,
                 settings=settings,
                 upload_url=(create_response.get("uri") or "").strip(),
             )
@@ -1925,31 +1925,33 @@ def post_reel_to_instagram(
             "media_product_type": media_details.get("media_product_type"),
         }
 
-    if method == "quick_tunnel":
-        with temporary_instagram_video_url(target, settings=settings) as hosted_video:
-            payload = build_instagram_reel_payload(
-                share_to_feed=share_value,
-                caption=instagram_caption,
-                thumb_offset_ms=thumb_offset_ms,
-                cover_url=cover_url,
-                audio_name=audio_name,
-                video_url=hosted_video["public_url"],
-            )
-            return publish_from_payload(
-                payload,
-                hosted_video_url=hosted_video["public_url"],
-                hosted_video_probe=hosted_video.get("probe"),
-            )
+    with sanitized_instagram_upload_file(target) as upload_target:
+        if method == "quick_tunnel":
+            with temporary_instagram_video_url(upload_target, settings=settings) as hosted_video:
+                payload = build_instagram_reel_payload(
+                    share_to_feed=share_value,
+                    caption=instagram_caption,
+                    thumb_offset_ms=thumb_offset_ms,
+                    cover_url=cover_url,
+                    audio_name=audio_name,
+                    video_url=hosted_video["public_url"],
+                )
+                return publish_from_payload(
+                    payload,
+                    upload_target,
+                    hosted_video_url=hosted_video["public_url"],
+                    hosted_video_probe=hosted_video.get("probe"),
+                )
 
-    payload = build_instagram_reel_payload(
-        share_to_feed=share_value,
-        caption=instagram_caption,
-        thumb_offset_ms=thumb_offset_ms,
-        cover_url=cover_url,
-        audio_name=audio_name,
-        upload_type="resumable",
-    )
-    return publish_from_payload(payload)
+        payload = build_instagram_reel_payload(
+            share_to_feed=share_value,
+            caption=instagram_caption,
+            thumb_offset_ms=thumb_offset_ms,
+            cover_url=cover_url,
+            audio_name=audio_name,
+            upload_type="resumable",
+        )
+        return publish_from_payload(payload, upload_target)
 
 
 def tiktok_settings():
@@ -2508,6 +2510,71 @@ def wait_for_tiktok_publish(publish_id, settings=None):
         f"{format_tiktok_publish_snapshot(last_snapshot)}. TikTok does not guarantee a short processing window, "
         "so retry with --no-wait and inspect the publish_id later if the upload bytes already look complete."
     )
+
+
+@contextmanager
+def sanitized_instagram_upload_file(file_path):
+    target = Path(file_path).expanduser().resolve()
+    if not target.exists():
+        raise FileNotFoundError(target)
+
+    ffmpeg_bin = shutil.which("ffmpeg")
+    if not ffmpeg_bin:
+        raise RuntimeError("ffmpeg is required to prepare Instagram uploads.")
+
+    with tempfile.NamedTemporaryFile(prefix="instagram-upload-", suffix=".mp4", delete=False) as handle:
+        sanitized_path = Path(handle.name)
+
+    cmd = [
+        ffmpeg_bin,
+        "-y",
+        "-i",
+        str(target),
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a:0?",
+        "-sn",
+        "-dn",
+        "-map_metadata",
+        "-1",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-pix_fmt",
+        "yuv420p",
+        "-profile:v",
+        "high",
+        "-level:v",
+        "4.1",
+        "-movflags",
+        "+faststart",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "128k",
+        "-ar",
+        "48000",
+        "-ac",
+        "2",
+        str(sanitized_path),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        try:
+            sanitized_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise RuntimeError(f"Instagram upload sanitization failed: {result.stderr[-500:]}")
+
+    try:
+        yield sanitized_path
+    finally:
+        try:
+            sanitized_path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 @contextmanager
