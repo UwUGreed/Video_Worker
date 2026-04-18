@@ -76,6 +76,7 @@ QUEUE_PATH = STATE_DIR / "queue.json"
 LOCK_PATH = STATE_DIR / "queue.lock"
 QUICK_TUNNEL_LOCK_PATH = STATE_DIR / "quick_tunnel.lock"
 QUICK_TUNNEL_STATE_PATH = STATE_DIR / "quick_tunnel_state.json"
+BUFFER_CHANNEL_CACHE_PATH = STATE_DIR / "buffer_channel_cache.json"
 OUT_DIR = REPO_DIR / "out"
 OUT_SNAPSHOT_NAMES = {"current", "current_shorts"}
 DEFAULT_TOKEN_PATH = SHORTS_DIR / "credentials" / "token.json"
@@ -112,6 +113,7 @@ DEFAULT_BUFFER_QUICK_TUNNEL_TIMEOUT_SECONDS = DEFAULT_INSTAGRAM_QUICK_TUNNEL_TIM
 DEFAULT_BUFFER_QUICK_TUNNEL_GRACE_SECONDS = DEFAULT_INSTAGRAM_QUICK_TUNNEL_GRACE_SECONDS
 DEFAULT_BUFFER_QUICK_TUNNEL_SETTLE_SECONDS = 15
 DEFAULT_BUFFER_TUNNEL_HOLD_SECONDS = 300
+DEFAULT_INSTAGRAM_PUBLISH_BACKEND = "native"
 DEFAULT_TIKTOK_PUBLISH_BACKEND = "native"
 DEFAULT_TIKTOK_POLL_SECONDS = 5
 DEFAULT_TIKTOK_POLL_TIMEOUT_SECONDS = 300
@@ -432,6 +434,26 @@ def mark_posted(queue_id, youtube_video_id=None, youtube_url=None, file_cleanup=
     update_queue_entry(queue_id, updater)
 
 
+def mark_posted_partial(queue_id, *, platform_results=None, platform_errors=None, file_cleanup=None):
+    file_cleanup = file_cleanup or {}
+    platform_results = dict(platform_results or {})
+    platform_errors = dict(platform_errors or {})
+
+    def updater(item):
+        item["status"] = "posted"
+        item["posted_at"] = now_utc_iso()
+        item["partial_success"] = True
+        item["partial_platform_errors"] = platform_errors
+        item["last_error"] = queue_platform_error_message(platform_errors) or None
+        for platform, result in platform_results.items():
+            apply_queue_entry_platform_result(item, platform, result)
+        item["local_file_deleted"] = bool(file_cleanup.get("deleted"))
+        item["local_file_deleted_at"] = now_utc_iso() if file_cleanup.get("deleted") else None
+        item["local_file_delete_error"] = file_cleanup.get("error")
+
+    update_queue_entry(queue_id, updater)
+
+
 def mark_failed(queue_id, error_message):
     def updater(item):
         item["status"] = "pending"
@@ -549,7 +571,7 @@ def apply_queue_entry_platform_result(item, platform, result):
         item["youtube_video_id"] = normalized_result.get("video_id")
         item["youtube_url"] = normalized_result.get("youtube_url")
     elif platform == "instagram":
-        item["instagram_media_id"] = normalized_result.get("media_id")
+        item["instagram_media_id"] = normalized_result.get("media_id") or normalized_result.get("buffer_post_id")
         item["instagram_permalink"] = normalized_result.get("permalink")
         item["instagram_shortcode"] = normalized_result.get("shortcode")
     elif platform == "tiktok":
@@ -579,7 +601,7 @@ def persist_queue_entry_platform_progress(queue_id, platform, result):
     update_queue_entry(queue_id, updater)
 
 
-def accept_buffer_tiktok_result(result, *, followup_error="", followup_snapshot=None):
+def accept_buffer_platform_result(platform, result, *, followup_error="", followup_snapshot=None):
     normalized = dict(result or {})
     buffer_post_id = (normalized.get("buffer_post_id") or normalized.get("id") or "").strip()
     if not buffer_post_id:
@@ -587,7 +609,7 @@ def accept_buffer_tiktok_result(result, *, followup_error="", followup_snapshot=
 
     normalized["buffer_post_id"] = buffer_post_id
     normalized["status"] = "accepted"
-    normalized["platform"] = "tiktok"
+    normalized["platform"] = platform
     normalized["provider"] = "buffer"
     normalized["buffer_post_accepted"] = True
     if followup_error:
@@ -597,8 +619,39 @@ def accept_buffer_tiktok_result(result, *, followup_error="", followup_snapshot=
     return normalized
 
 
+def accept_buffer_tiktok_result(result, *, followup_error="", followup_snapshot=None):
+    return accept_buffer_platform_result(
+        "tiktok",
+        result,
+        followup_error=followup_error,
+        followup_snapshot=followup_snapshot,
+    )
+
+
+def accept_buffer_instagram_result(result, *, followup_error="", followup_snapshot=None):
+    return accept_buffer_platform_result(
+        "instagram",
+        result,
+        followup_error=followup_error,
+        followup_snapshot=followup_snapshot,
+    )
+
+
 def queue_platform_error_message(errors):
     return "; ".join(f"{platform}: {message}" for platform, message in errors.items())
+
+
+def should_finalize_queue_entry_after_social_failures(active_platforms, platform_results, platform_errors):
+    if not env_bool("VIDEO_CONTINUE_ON_SOCIAL_FAILURE", True):
+        return False
+    if "youtube" not in active_platforms or "youtube" not in platform_results:
+        return False
+    unresolved = [platform for platform in active_platforms if platform not in platform_results]
+    if not unresolved:
+        return False
+    if any(platform == "youtube" for platform in unresolved):
+        return False
+    return all(platform in {"instagram", "tiktok"} for platform in unresolved)
 
 
 def post_reserved_queue_entry_to_platforms(entry, *, interactive_auth=False, platform_targets=None):
@@ -624,7 +677,18 @@ def post_reserved_queue_entry_to_platforms(entry, *, interactive_auth=False, pla
             if platform == "youtube":
                 result = upload_short_to_youtube(working_entry, interactive=interactive_auth)
             elif platform == "instagram":
-                result = post_reel_to_instagram(working_entry["file_path"], caption)
+                result = post_reel_to_instagram(
+                    working_entry["file_path"],
+                    caption,
+                    existing_platform_result=existing_result,
+                    progress_callback=(
+                        lambda partial_result, queue_id=working_entry["queue_id"]: persist_queue_entry_platform_progress(
+                            queue_id,
+                            "instagram",
+                            partial_result,
+                        )
+                    ),
+                )
             else:
                 result = post_video_to_tiktok(
                     working_entry["file_path"],
@@ -639,6 +703,16 @@ def post_reserved_queue_entry_to_platforms(entry, *, interactive_auth=False, pla
                     ),
                 )
         except Exception as exc:
+            if platform == "instagram":
+                accepted_result = accept_buffer_instagram_result(
+                    queue_entry_platform_results(working_entry).get("instagram") or existing_result,
+                    followup_error=str(exc),
+                )
+                if accepted_result:
+                    completed_results[platform] = dict(accepted_result)
+                    persist_queue_entry_platform_result(working_entry["queue_id"], platform, accepted_result)
+                    apply_queue_entry_platform_result(working_entry, platform, accepted_result)
+                    continue
             if platform == "tiktok":
                 accepted_result = accept_buffer_tiktok_result(
                     queue_entry_platform_results(working_entry).get("tiktok") or existing_result,
@@ -1016,6 +1090,27 @@ def post_next_queued_short(
 
     if platform_errors or len(completed_platforms) != len(active_platforms):
         message = queue_platform_error_message(platform_errors) or "One or more platform posts did not complete."
+        if should_finalize_queue_entry_after_social_failures(active_platforms, platform_results, platform_errors):
+            mark_posted_partial(
+                entry["queue_id"],
+                platform_results=platform_results,
+                platform_errors=platform_errors,
+                file_cleanup={"deleted": False, "error": None, "skipped": True},
+            )
+            cleanup_summary = run_storage_maintenance()
+            return {
+                "status": "partial_posted",
+                "queue_id": entry["queue_id"],
+                "message": message,
+                "active_platforms": active_platforms,
+                "completed_platforms": completed_platforms,
+                "platform_results": platform_results,
+                "platform_errors": platform_errors,
+                "queue_deleted": False,
+                "local_file_deleted": False,
+                "local_file_delete_error": None,
+                "cleanup": cleanup_summary,
+            }
         mark_failed(entry["queue_id"], message)
         cleanup_summary = run_storage_maintenance()
         return {
@@ -1112,6 +1207,17 @@ def normalize_instagram_publish_method(value):
     return method
 
 
+def normalize_instagram_publish_backend(value):
+    backend = (value or "").strip().lower()
+    if not backend:
+        return DEFAULT_INSTAGRAM_PUBLISH_BACKEND
+    if backend not in {"native", "buffer"}:
+        raise RuntimeError(
+            f"Unsupported Instagram publish backend {value!r}. Use 'native' or 'buffer'."
+        )
+    return backend
+
+
 def normalize_tiktok_publish_backend(value):
     backend = (value or "").strip().lower()
     if not backend:
@@ -1181,6 +1287,11 @@ def raise_tiktok_error(data, default_message):
 
 
 def instagram_settings():
+    raw_backend = (os.environ.get("INSTAGRAM_PUBLISH_BACKEND") or "").strip()
+    buffer_api_key = (os.environ.get("BUFFER_API_KEY") or "").strip()
+    publish_backend = normalize_instagram_publish_backend(raw_backend)
+    if not raw_backend and buffer_api_key:
+        publish_backend = "buffer"
     access_token = (os.environ.get("INSTAGRAM_ACCESS_TOKEN") or "").strip()
     ig_user_id = (os.environ.get("INSTAGRAM_IG_USER_ID") or "").strip()
     app_secret = (os.environ.get("INSTAGRAM_APP_SECRET") or "").strip()
@@ -1192,15 +1303,16 @@ def instagram_settings():
         api_version = DEFAULT_INSTAGRAM_API_VERSION
     if not graph_host:
         graph_host = default_graph_host
-    if not access_token:
+    if publish_backend != "buffer" and not access_token:
         raise RuntimeError(
             "Missing INSTAGRAM_ACCESS_TOKEN. Copy shorts/instagram.env.example to shorts/instagram.env and fill it in."
         )
-    if not ig_user_id:
+    if publish_backend != "buffer" and not ig_user_id:
         raise RuntimeError(
             "Missing INSTAGRAM_IG_USER_ID. Copy shorts/instagram.env.example to shorts/instagram.env and fill it in."
         )
     return {
+        "publish_backend": publish_backend,
         "access_token": access_token,
         "ig_user_id": ig_user_id,
         "app_secret": app_secret,
@@ -1968,6 +2080,107 @@ def upload_instagram_reel_file(container_id, file_path, settings=None, upload_ur
     return effective_upload_url
 
 
+def post_reel_to_instagram_via_buffer(
+    file_path,
+    caption="",
+    *,
+    share_to_feed=None,
+    wait_for_finish=True,
+    existing_platform_result=None,
+    progress_callback=None,
+):
+    if not wait_for_finish:
+        raise RuntimeError(
+            "Buffer-backed Instagram publishing requires waiting so the temporary public video URL stays online "
+            "until Buffer finishes fetching and sending the video."
+        )
+
+    settings = instagram_settings()
+    buffer = buffer_settings()
+    target = Path(file_path).expanduser().resolve()
+    if not target.exists():
+        raise FileNotFoundError(target)
+
+    instagram_caption = build_instagram_caption(caption, settings=settings)
+    share_value = settings["share_to_feed"] if share_to_feed is None else bool(share_to_feed)
+    channel = query_buffer_instagram_channel(settings=buffer)
+    existing_result = dict(existing_platform_result or {})
+    existing_buffer_post_id = (existing_result.get("buffer_post_id") or "").strip()
+
+    if existing_buffer_post_id:
+        return accept_buffer_instagram_result(existing_result)
+
+    with sanitized_instagram_upload_file(target) as upload_target:
+        with temporary_buffer_video_url(upload_target, settings=buffer) as hosted_video:
+            created = buffer_graphql(
+                buffer,
+                """
+                mutation CreatePost($input: CreatePostInput!) {
+                  createPost(input: $input) {
+                    __typename
+                    ... on PostActionSuccess {
+                      post {
+                        id
+                        status
+                        text
+                        shareMode
+                        schedulingType
+                        sharedNow
+                        assets {
+                          source
+                        }
+                      }
+                    }
+                    ... on MutationError {
+                      message
+                    }
+                  }
+                }
+                """,
+                variables={
+                    "input": {
+                        "text": instagram_caption,
+                        "channelId": channel["id"],
+                        "schedulingType": "automatic",
+                        "mode": "shareNow",
+                        "source": "video_worker_instagram_buffer",
+                        "assets": {
+                            "videos": [
+                                {
+                                    "url": hosted_video["public_url"],
+                                }
+                            ]
+                        },
+                    }
+                },
+                default_message="Buffer Instagram createPost failed.",
+            ).get("createPost") or {}
+
+            if created.get("__typename") != "PostActionSuccess":
+                message = (created.get("message") or "Buffer Instagram createPost failed.").strip()
+                raise RuntimeError(message)
+
+            post_snapshot = created.get("post") or {}
+            accepted_result = accept_buffer_instagram_result(
+                build_buffer_instagram_result(
+                    post_snapshot,
+                    channel,
+                    target,
+                    instagram_caption,
+                    hosted_video_url=hosted_video["public_url"],
+                )
+            )
+            accepted_result["share_to_feed"] = share_value
+            if progress_callback and accepted_result:
+                progress_callback(accepted_result)
+
+            hold_seconds = int(buffer.get("tunnel_hold_seconds") or 0)
+            if hold_seconds > 0:
+                time.sleep(hold_seconds)
+
+            return accepted_result
+
+
 def post_reel_to_instagram(
     file_path,
     caption="",
@@ -1978,11 +2191,28 @@ def post_reel_to_instagram(
     audio_name="",
     wait_for_finish=True,
     publish_method=None,
+    existing_platform_result=None,
+    progress_callback=None,
 ):
     settings = instagram_settings()
     target = Path(file_path).expanduser().resolve()
     if not target.exists():
         raise FileNotFoundError(target)
+
+    if settings["publish_backend"] == "buffer":
+        if thumb_offset_ms is not None or cover_url or audio_name:
+            raise RuntimeError(
+                "The Buffer Instagram backend currently supports caption + video delivery only. "
+                "Remove --thumb-offset-ms, --cover-url, and --audio-name."
+            )
+        return post_reel_to_instagram_via_buffer(
+            target,
+            caption,
+            share_to_feed=share_to_feed,
+            wait_for_finish=wait_for_finish,
+            existing_platform_result=existing_platform_result,
+            progress_callback=progress_callback,
+        )
 
     method = normalize_instagram_publish_method(publish_method or settings["publish_method"])
     settings = dict(settings)
@@ -2177,12 +2407,14 @@ def buffer_settings():
     api_key = (os.environ.get("BUFFER_API_KEY") or "").strip()
     if not api_key:
         raise RuntimeError(
-            "Missing BUFFER_API_KEY. Generate one in Buffer and add it to shorts/tiktok.env before using "
-            "the Buffer TikTok backend."
+            "Missing BUFFER_API_KEY. Generate one in Buffer and add it to your shorts env file before using "
+            "the Buffer publishing backends."
         )
     return {
         "api_key": api_key,
         "api_url": (os.environ.get("BUFFER_API_URL") or DEFAULT_BUFFER_API_URL).strip() or DEFAULT_BUFFER_API_URL,
+        "instagram_channel_id": (os.environ.get("BUFFER_INSTAGRAM_CHANNEL_ID") or "").strip(),
+        "instagram_channel_name": (os.environ.get("BUFFER_INSTAGRAM_CHANNEL_NAME") or "").strip(),
         "tiktok_channel_id": (os.environ.get("BUFFER_TIKTOK_CHANNEL_ID") or "").strip(),
         "tiktok_channel_name": (os.environ.get("BUFFER_TIKTOK_CHANNEL_NAME") or "").strip(),
         "cloudflared_bin": (os.environ.get("BUFFER_CLOUDFLARED_BIN") or DEFAULT_BUFFER_CLOUDFLARED_BIN).strip()
@@ -2261,11 +2493,45 @@ def buffer_graphql(settings, query, *, variables=None, default_message="Buffer G
     return payload.get("data") or {}
 
 
-def query_buffer_tiktok_channel(settings=None):
-    settings = settings or buffer_settings()
-    configured_channel_id = settings["tiktok_channel_id"]
-    configured_channel_name = settings["tiktok_channel_name"].lower()
+def buffer_cache_key(settings):
+    return hashlib.sha256((settings.get("api_key") or "").encode("utf-8")).hexdigest()[:24]
 
+
+def load_buffer_channel_cache(settings=None):
+    settings = settings or buffer_settings()
+    cache = load_json_or_default(BUFFER_CHANNEL_CACHE_PATH, {})
+    return dict((cache.get(buffer_cache_key(settings)) or {}).get("services") or {})
+
+
+def save_buffer_channel_cache(channels, settings=None):
+    settings = settings or buffer_settings()
+    ensure_layout()
+    cache = load_json_or_default(BUFFER_CHANNEL_CACHE_PATH, {})
+    grouped = {}
+    for channel in list(channels or []):
+        service = (channel.get("service") or "").strip().lower()
+        if not service:
+            continue
+        grouped.setdefault(service, []).append(
+            {
+                "id": channel.get("id"),
+                "name": channel.get("name"),
+                "displayName": channel.get("displayName"),
+                "service": service,
+                "isQueuePaused": channel.get("isQueuePaused"),
+                "organization_id": channel.get("organization_id"),
+                "organization_name": channel.get("organization_name"),
+            }
+        )
+    cache[buffer_cache_key(settings)] = {
+        "updated_at": now_utc_iso(),
+        "services": grouped,
+    }
+    atomic_write_json(BUFFER_CHANNEL_CACHE_PATH, cache)
+
+
+def list_buffer_channels(settings=None):
+    settings = settings or buffer_settings()
     orgs_data = buffer_graphql(
         settings,
         """
@@ -2303,19 +2569,31 @@ def query_buffer_tiktok_channel(settings=None):
             default_message="Buffer channel lookup failed.",
         )
         for channel in list(channels_data.get("channels") or []):
-            if (channel.get("service") or "").strip().lower() != "tiktok":
-                continue
             channel = dict(channel)
+            service = (channel.get("service") or "").strip().lower()
+            if not service:
+                continue
+            channel["service"] = service
             channel["organization_id"] = organization["id"]
             channel["organization_name"] = organization.get("name")
             candidates.append(channel)
+
+    save_buffer_channel_cache(candidates, settings=settings)
+    return candidates
+
+
+def select_buffer_channel(service, candidates, settings):
+    service = (service or "").strip().lower()
+    configured_channel_id = (settings.get(f"{service}_channel_id") or "").strip()
+    configured_channel_name = (settings.get(f"{service}_channel_name") or "").strip().lower()
+    candidates = [dict(channel) for channel in list(candidates or []) if (channel.get("service") or "").strip().lower() == service]
 
     if configured_channel_id:
         for channel in candidates:
             if channel.get("id") == configured_channel_id:
                 return channel
         raise RuntimeError(
-            f"BUFFER_TIKTOK_CHANNEL_ID={configured_channel_id!r} did not match any connected Buffer TikTok channels."
+            f"BUFFER_{service.upper()}_CHANNEL_ID={configured_channel_id!r} did not match any connected Buffer {service.title()} channels."
         )
 
     if configured_channel_name:
@@ -2332,21 +2610,56 @@ def query_buffer_tiktok_channel(settings=None):
             return named_candidates[0]
         if len(named_candidates) > 1:
             raise RuntimeError(
-                "BUFFER_TIKTOK_CHANNEL_NAME matched multiple Buffer TikTok channels. "
-                f"Use BUFFER_TIKTOK_CHANNEL_ID instead: {named_candidates}"
+                f"BUFFER_{service.upper()}_CHANNEL_NAME matched multiple Buffer {service.title()} channels. "
+                f"Use BUFFER_{service.upper()}_CHANNEL_ID instead: {named_candidates}"
             )
         raise RuntimeError(
-            f"BUFFER_TIKTOK_CHANNEL_NAME={settings['tiktok_channel_name']!r} did not match any Buffer TikTok channels."
+            f"BUFFER_{service.upper()}_CHANNEL_NAME={settings.get(f'{service}_channel_name')!r} did not match any connected Buffer {service.title()} channels."
         )
 
     if len(candidates) == 1:
         return candidates[0]
     if not candidates:
-        raise RuntimeError("No TikTok channels are connected in Buffer for this API key.")
+        raise RuntimeError(f"No {service.title()} channels are connected in Buffer for this API key.")
     raise RuntimeError(
-        "Multiple TikTok channels are connected in Buffer. Set BUFFER_TIKTOK_CHANNEL_ID or "
-        f"BUFFER_TIKTOK_CHANNEL_NAME to pick one: {candidates}"
+        f"Multiple {service.title()} channels are connected in Buffer. Set BUFFER_{service.upper()}_CHANNEL_ID "
+        f"or BUFFER_{service.upper()}_CHANNEL_NAME to pick one: {candidates}"
     )
+
+
+def query_buffer_channel(service, settings=None):
+    settings = settings or buffer_settings()
+    service = (service or "").strip().lower()
+    configured_channel_id = (settings.get(f"{service}_channel_id") or "").strip()
+    configured_channel_name = (settings.get(f"{service}_channel_name") or "").strip()
+
+    if configured_channel_id:
+        return {
+            "id": configured_channel_id,
+            "name": configured_channel_name or None,
+            "displayName": configured_channel_name or None,
+            "service": service,
+            "organization_id": None,
+            "organization_name": None,
+        }
+
+    cached_channels = load_buffer_channel_cache(settings=settings).get(service) or []
+    if cached_channels:
+        return select_buffer_channel(service, cached_channels, settings)
+
+    return select_buffer_channel(
+        service,
+        list_buffer_channels(settings=settings),
+        settings,
+    )
+
+
+def query_buffer_tiktok_channel(settings=None):
+    return query_buffer_channel("tiktok", settings=settings)
+
+
+def query_buffer_instagram_channel(settings=None):
+    return query_buffer_channel("instagram", settings=settings)
 
 
 def query_buffer_post_error_fields(settings=None):
@@ -2433,13 +2746,13 @@ def format_buffer_post_snapshot(snapshot):
     return ", ".join(parts) or "no status details"
 
 
-def build_buffer_tiktok_result(post_snapshot, channel, target, tiktok_title, *, hosted_video_url=None):
+def build_buffer_post_result(platform, post_snapshot, channel, target, title, *, hosted_video_url=None):
     result = {
         "status": (post_snapshot.get("status") or "").strip().lower() or "unknown",
-        "platform": "tiktok",
+        "platform": platform,
         "provider": "buffer",
         "file_path": str(target),
-        "title": tiktok_title or None,
+        "title": title or None,
         "buffer_post_id": post_snapshot.get("id"),
         "buffer_share_mode": post_snapshot.get("shareMode"),
         "buffer_scheduling_type": post_snapshot.get("schedulingType"),
@@ -2452,6 +2765,28 @@ def build_buffer_tiktok_result(post_snapshot, channel, target, tiktok_title, *, 
     if hosted_video_url:
         result["hosted_video_url"] = hosted_video_url
     return result
+
+
+def build_buffer_tiktok_result(post_snapshot, channel, target, tiktok_title, *, hosted_video_url=None):
+    return build_buffer_post_result(
+        "tiktok",
+        post_snapshot,
+        channel,
+        target,
+        tiktok_title,
+        hosted_video_url=hosted_video_url,
+    )
+
+
+def build_buffer_instagram_result(post_snapshot, channel, target, instagram_caption, *, hosted_video_url=None):
+    return build_buffer_post_result(
+        "instagram",
+        post_snapshot,
+        channel,
+        target,
+        instagram_caption,
+        hosted_video_url=hosted_video_url,
+    )
 
 
 def wait_for_buffer_post(post_id, settings=None, *, error_fields=None):
@@ -2481,6 +2816,11 @@ def temporary_buffer_video_url(file_path, settings=None):
             "cloudflared_bin": settings["cloudflared_bin"],
             "quick_tunnel_timeout_seconds": settings["quick_tunnel_timeout_seconds"],
             "quick_tunnel_grace_seconds": settings["quick_tunnel_grace_seconds"],
+            "quick_tunnel_min_interval_seconds": settings["quick_tunnel_min_interval_seconds"],
+            "quick_tunnel_max_attempts": settings["quick_tunnel_max_attempts"],
+            "quick_tunnel_retry_delay_seconds": settings["quick_tunnel_retry_delay_seconds"],
+            "quick_tunnel_doh_url": settings["quick_tunnel_doh_url"],
+            "quick_tunnel_settle_seconds": settings["quick_tunnel_settle_seconds"],
         },
     ) as hosted_video:
         yield hosted_video

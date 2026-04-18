@@ -21,6 +21,11 @@ def main():
     parser.add_argument("--cover-url", default="", help="Optional public JPEG URL for the Reel cover image.")
     parser.add_argument("--audio-name", default="", help="Optional original-audio display name.")
     parser.add_argument(
+        "--buffer",
+        action="store_true",
+        help="Publish through Buffer instead of the legacy direct Instagram API flow.",
+    )
+    parser.add_argument(
         "--check-token",
         action="store_true",
         help="Validate the configured Instagram access token and exit without publishing.",
@@ -42,8 +47,26 @@ def main():
     )
     args = parser.parse_args()
 
+    if args.buffer:
+        os.environ["INSTAGRAM_PUBLISH_BACKEND"] = "buffer"
+    if args.buffer and args.resumable_upload:
+        parser.error("Buffer publishing does not use --resumable-upload. Remove that flag and retry.")
+    if args.buffer and args.no_wait:
+        parser.error("Buffer publishing requires waiting so the temporary public video URL stays online.")
+
     if args.check_token:
         settings = instagram_settings()
+        if settings.get("publish_backend") == "buffer":
+            print(
+                json.dumps(
+                    {
+                        "status": "skipped",
+                        "message": "Instagram is configured to publish through Buffer; no direct Instagram token check is required.",
+                    },
+                    indent=2,
+                )
+            )
+            return
         if args.resumable_upload and not (os.environ.get("INSTAGRAM_GRAPH_HOST") or "").strip():
             settings = dict(settings)
             settings["publish_method"] = "resumable"
