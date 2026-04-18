@@ -2140,15 +2140,6 @@ def post_reel_to_instagram_via_buffer(
 
     with sanitized_instagram_upload_file(target) as upload_target:
         with temporary_buffer_video_url(upload_target, settings=buffer) as hosted_video:
-            hold_seconds = int(buffer.get("tunnel_hold_seconds") or 0)
-            print(
-                "Buffer Instagram upload path: "
-                f"original={target} "
-                f"served={upload_target} "
-                f"served_size={upload_target.stat().st_size} "
-                f"hold_seconds={hold_seconds}",
-                file=sys.stderr,
-            )
             create_post_input = {
                 "text": instagram_caption,
                 "channelId": channel["id"],
@@ -2226,6 +2217,7 @@ def post_reel_to_instagram_via_buffer(
             if progress_callback and accepted_result:
                 progress_callback(accepted_result)
 
+            hold_seconds = int(buffer.get("tunnel_hold_seconds") or 0)
             hold_buffer_tunnel_for_fetch("Instagram", hosted_video, hold_seconds)
 
             return accepted_result
