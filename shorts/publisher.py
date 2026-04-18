@@ -77,6 +77,7 @@ LOCK_PATH = STATE_DIR / "queue.lock"
 QUICK_TUNNEL_LOCK_PATH = STATE_DIR / "quick_tunnel.lock"
 QUICK_TUNNEL_STATE_PATH = STATE_DIR / "quick_tunnel_state.json"
 BUFFER_CHANNEL_CACHE_PATH = STATE_DIR / "buffer_channel_cache.json"
+BUFFER_SCHEMA_CACHE_PATH = STATE_DIR / "buffer_schema_cache.json"
 OUT_DIR = REPO_DIR / "out"
 OUT_SNAPSHOT_NAMES = {"current", "current_shorts"}
 DEFAULT_TOKEN_PATH = SHORTS_DIR / "credentials" / "token.json"
@@ -2112,6 +2113,21 @@ def post_reel_to_instagram_via_buffer(
 
     with sanitized_instagram_upload_file(target) as upload_target:
         with temporary_buffer_video_url(upload_target, settings=buffer) as hosted_video:
+            create_post_input = {
+                "text": instagram_caption,
+                "channelId": channel["id"],
+                "schedulingType": "automatic",
+                "mode": "shareNow",
+                "source": "video_worker_instagram_buffer",
+                "assets": {
+                    "videos": [
+                        {
+                            "url": hosted_video["public_url"],
+                        }
+                    ]
+                },
+            }
+            create_post_input.update(buffer_instagram_reel_input_fields(settings=buffer))
             created = buffer_graphql(
                 buffer,
                 """
@@ -2138,20 +2154,7 @@ def post_reel_to_instagram_via_buffer(
                 }
                 """,
                 variables={
-                    "input": {
-                        "text": instagram_caption,
-                        "channelId": channel["id"],
-                        "schedulingType": "automatic",
-                        "mode": "shareNow",
-                        "source": "video_worker_instagram_buffer",
-                        "assets": {
-                            "videos": [
-                                {
-                                    "url": hosted_video["public_url"],
-                                }
-                            ]
-                        },
-                    }
+                    "input": create_post_input,
                 },
                 default_message="Buffer Instagram createPost failed.",
             ).get("createPost") or {}
@@ -2175,8 +2178,7 @@ def post_reel_to_instagram_via_buffer(
                 progress_callback(accepted_result)
 
             hold_seconds = int(buffer.get("tunnel_hold_seconds") or 0)
-            if hold_seconds > 0:
-                time.sleep(hold_seconds)
+            hold_buffer_tunnel_for_fetch("Instagram", hosted_video, hold_seconds)
 
             return accepted_result
 
@@ -2530,6 +2532,24 @@ def save_buffer_channel_cache(channels, settings=None):
     atomic_write_json(BUFFER_CHANNEL_CACHE_PATH, cache)
 
 
+def load_buffer_schema_cache(settings=None):
+    settings = settings or buffer_settings()
+    cache = load_json_or_default(BUFFER_SCHEMA_CACHE_PATH, {})
+    return dict(cache.get(buffer_cache_key(settings)) or {})
+
+
+def save_buffer_instagram_reel_input_fields(reel_fields, settings=None, *, source="schema"):
+    settings = settings or buffer_settings()
+    ensure_layout()
+    cache = load_json_or_default(BUFFER_SCHEMA_CACHE_PATH, {})
+    existing = dict(cache.get(buffer_cache_key(settings)) or {})
+    existing["updated_at"] = now_utc_iso()
+    existing["instagram_reel_input_fields"] = dict(reel_fields or {})
+    existing["instagram_reel_input_fields_source"] = source
+    cache[buffer_cache_key(settings)] = existing
+    atomic_write_json(BUFFER_SCHEMA_CACHE_PATH, cache)
+
+
 def list_buffer_channels(settings=None):
     settings = settings or buffer_settings()
     orgs_data = buffer_graphql(
@@ -2681,6 +2701,71 @@ def query_buffer_post_error_fields(settings=None):
     return [field.get("name") for field in fields if field.get("name")]
 
 
+def query_buffer_create_post_input_fields(settings=None):
+    settings = settings or buffer_settings()
+    data = buffer_graphql(
+        settings,
+        """
+        query GetCreatePostInputFields {
+          inputType: __type(name: "CreatePostInput") {
+            inputFields {
+              name
+              type {
+                kind
+                name
+                ofType {
+                  kind
+                  name
+                  ofType {
+                    kind
+                    name
+                    ofType {
+                      kind
+                      name
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+        """,
+        default_message="Buffer create post schema lookup failed.",
+    )
+    fields = list(((data.get("inputType") or {}).get("inputFields")) or [])
+    return [field for field in fields if field.get("name")]
+
+
+def buffer_instagram_reel_input_fields(settings=None):
+    settings = settings or buffer_settings()
+    cached_fields = load_buffer_schema_cache(settings=settings).get("instagram_reel_input_fields") or {}
+    if cached_fields:
+        return dict(cached_fields)
+
+    try:
+        fields = query_buffer_create_post_input_fields(settings=settings)
+    except Exception as exc:
+        print(f"warning: Buffer CreatePostInput schema probe failed; using postType fallback: {exc}", file=sys.stderr)
+        fallback_fields = {"postType": "reel"}
+        save_buffer_instagram_reel_input_fields(fallback_fields, settings=settings, source="fallback")
+        return fallback_fields
+
+    field_names = {field.get("name") for field in fields if field.get("name")}
+    for candidate in ("type", "postType", "post_type"):
+        if candidate in field_names:
+            reel_fields = {candidate: "reel"}
+            save_buffer_instagram_reel_input_fields(reel_fields, settings=settings, source="schema")
+            return reel_fields
+
+    print(
+        "warning: Buffer CreatePostInput schema did not expose a reel type field; using postType fallback.",
+        file=sys.stderr,
+    )
+    fallback_fields = {"postType": "reel"}
+    save_buffer_instagram_reel_input_fields(fallback_fields, settings=settings, source="fallback")
+    return fallback_fields
+
+
 def fetch_buffer_post(post_id, settings=None, *, error_fields=None):
     settings = settings or buffer_settings()
     buffer_error_fields = list(error_fields or [])
@@ -2787,6 +2872,13 @@ def build_buffer_instagram_result(post_snapshot, channel, target, instagram_capt
         instagram_caption,
         hosted_video_url=hosted_video_url,
     )
+
+
+def hold_buffer_tunnel_for_fetch(platform, hosted_video, hold_seconds):
+    public_url = (hosted_video or {}).get("public_url") or ""
+    print(f"Buffer {platform}: holding temporary video URL open for {hold_seconds}s: {public_url}")
+    if hold_seconds > 0:
+        time.sleep(hold_seconds)
 
 
 def wait_for_buffer_post(post_id, settings=None, *, error_fields=None):
@@ -3382,8 +3474,7 @@ def post_video_to_tiktok_via_buffer(
             return accepted_result
 
         hold_seconds = int(buffer.get("tunnel_hold_seconds") or 0)
-        if hold_seconds > 0:
-            time.sleep(hold_seconds)
+        hold_buffer_tunnel_for_fetch("TikTok", hosted_video, hold_seconds)
 
         return accepted_result
 
