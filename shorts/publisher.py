@@ -750,6 +750,14 @@ def remove_posted_clip_file(file_path):
     }
 
 
+def should_keep_clip_after_buffer_accept(platform_results):
+    for platform in ("instagram", "tiktok"):
+        result = dict((platform_results or {}).get(platform) or {})
+        if result.get("provider") == "buffer" and result.get("buffer_post_accepted") and not result.get("buffer_sent_at"):
+            return True
+    return False
+
+
 def youtube_paths():
     client_secret = resolve_optional_path(
         os.environ.get("YOUTUBE_CLIENT_SECRET_FILE"),
@@ -1125,7 +1133,10 @@ def post_next_queued_short(
             "cleanup": cleanup_summary,
         }
 
-    file_cleanup = remove_posted_clip_file(entry["file_path"])
+    if should_keep_clip_after_buffer_accept(platform_results):
+        file_cleanup = {"deleted": False, "error": None, "skipped": True}
+    else:
+        file_cleanup = remove_posted_clip_file(entry["file_path"])
     youtube_result = platform_results.get("youtube") or {}
     mark_posted(
         entry["queue_id"],
@@ -3164,6 +3175,8 @@ def sanitized_instagram_upload_file(file_path):
             "-dn",
             "-map_metadata",
             "-1",
+            "-vf",
+            "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2,setsar=1",
             "-r",
             "30",
             "-g",
@@ -3182,8 +3195,16 @@ def sanitized_instagram_upload_file(file_path):
             "high",
             "-level:v",
             "4.1",
+            "-b:v",
+            "8000k",
+            "-maxrate",
+            "8000k",
+            "-bufsize",
+            "16000k",
             "-movflags",
             "+faststart",
+            "-video_track_timescale",
+            "30000",
             "-c:a",
             "aac",
             "-b:a",
