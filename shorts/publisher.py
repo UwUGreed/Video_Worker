@@ -13,7 +13,7 @@ import tempfile
 import threading
 import time
 import uuid
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -1570,11 +1570,14 @@ def temporary_instagram_video_url(file_path, settings=None):
     max_attempts = max(int(settings.get("quick_tunnel_max_attempts") or 1), 1)
     retry_delay_seconds = max(int(settings.get("quick_tunnel_retry_delay_seconds") or 1), 1)
     last_error = None
+    hosted_video = None
+    active_stack = None
 
     with serve_file_over_http(file_path) as local_server:
         for attempt in range(1, max_attempts + 1):
             try:
-                with cloudflare_quick_tunnel(local_server["local_url"], settings=settings) as tunnel:
+                with ExitStack() as stack:
+                    tunnel = stack.enter_context(cloudflare_quick_tunnel(local_server["local_url"], settings=settings))
                     public_url = f"{tunnel['public_origin']}{local_server['route']}"
                     settle_seconds = max(int(settings.get("quick_tunnel_settle_seconds") or 0), 0)
                     if settle_seconds > 0:
@@ -1585,22 +1588,27 @@ def temporary_instagram_video_url(file_path, settings=None):
                         required=True,
                         doh_url=(settings.get("quick_tunnel_doh_url") or "").strip(),
                     )
-                    yield {
+                    hosted_video = {
                         "local_url": local_server["local_url"],
                         "public_origin": tunnel["public_origin"],
                         "public_url": public_url,
                         "probe": probe,
                     }
-                    return
+                    active_stack = stack.pop_all()
+                    break
             except Exception as exc:
                 last_error = exc
                 if attempt >= max_attempts:
                     break
                 time.sleep(retry_delay_seconds * attempt)
 
-    raise RuntimeError(
-        f"Cloudflare quick tunnel failed after {max_attempts} attempts. Last error: {last_error}"
-    ) from last_error
+    if active_stack is None or hosted_video is None:
+        raise RuntimeError(
+            f"Cloudflare quick tunnel failed after {max_attempts} attempts. Last error: {last_error}"
+        ) from last_error
+
+    with active_stack:
+        yield hosted_video
 
 
 def build_instagram_reel_payload(
