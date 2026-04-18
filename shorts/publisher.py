@@ -73,6 +73,8 @@ CLIPS_DIR = configured_dir("VIDEO_SHORTS_CLIPS_DIR", SHORTS_DIR / "clips")
 STATE_DIR = configured_dir("VIDEO_SHORTS_STATE_DIR", SHORTS_DIR / "state")
 QUEUE_PATH = STATE_DIR / "queue.json"
 LOCK_PATH = STATE_DIR / "queue.lock"
+QUICK_TUNNEL_LOCK_PATH = STATE_DIR / "quick_tunnel.lock"
+QUICK_TUNNEL_STATE_PATH = STATE_DIR / "quick_tunnel_state.json"
 OUT_DIR = REPO_DIR / "out"
 OUT_SNAPSHOT_NAMES = {"current", "current_shorts"}
 DEFAULT_TOKEN_PATH = SHORTS_DIR / "credentials" / "token.json"
@@ -95,6 +97,9 @@ DEFAULT_INSTAGRAM_POLL_TIMEOUT_SECONDS = 300
 DEFAULT_INSTAGRAM_PUBLISH_METHOD = "quick_tunnel"
 DEFAULT_INSTAGRAM_QUICK_TUNNEL_TIMEOUT_SECONDS = 45
 DEFAULT_INSTAGRAM_QUICK_TUNNEL_GRACE_SECONDS = 90
+DEFAULT_QUICK_TUNNEL_MIN_INTERVAL_SECONDS = 30
+DEFAULT_QUICK_TUNNEL_MAX_ATTEMPTS = 2
+DEFAULT_QUICK_TUNNEL_RETRY_DELAY_SECONDS = 45
 DEFAULT_INSTAGRAM_CTA_TEXT = "Dont forget to Like and follow"
 DEFAULT_SHORTFORM_DESCRIPTION_TEXT = "3chan-style greentext story short."
 DEFAULT_SHORTFORM_HASHTAGS = ["#shorts", "#greentext", "#storytime"]
@@ -1217,6 +1222,21 @@ def instagram_settings():
             DEFAULT_INSTAGRAM_QUICK_TUNNEL_GRACE_SECONDS,
             minimum=0,
         ),
+        "quick_tunnel_min_interval_seconds": env_int(
+            "INSTAGRAM_QUICK_TUNNEL_MIN_INTERVAL_SECONDS",
+            DEFAULT_QUICK_TUNNEL_MIN_INTERVAL_SECONDS,
+            minimum=0,
+        ),
+        "quick_tunnel_max_attempts": env_int(
+            "INSTAGRAM_QUICK_TUNNEL_MAX_ATTEMPTS",
+            DEFAULT_QUICK_TUNNEL_MAX_ATTEMPTS,
+            minimum=1,
+        ),
+        "quick_tunnel_retry_delay_seconds": env_int(
+            "INSTAGRAM_QUICK_TUNNEL_RETRY_DELAY_SECONDS",
+            DEFAULT_QUICK_TUNNEL_RETRY_DELAY_SECONDS,
+            minimum=1,
+        ),
     }
 
 
@@ -1464,6 +1484,40 @@ def wait_for_trycloudflare_url(process, timeout_seconds):
     raise RuntimeError(f"Timed out waiting for cloudflared to create a quick tunnel.\n{details}")
 
 
+def load_json_or_default(path, default):
+    candidate = Path(path)
+    if not candidate.exists():
+        return default
+    try:
+        with open(candidate, "r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return default
+
+
+@contextmanager
+def quick_tunnel_slot(settings=None):
+    ensure_layout()
+    settings = settings or instagram_settings()
+    min_interval = max(int(settings.get("quick_tunnel_min_interval_seconds") or 0), 0)
+
+    with open(QUICK_TUNNEL_LOCK_PATH, "a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            state = load_json_or_default(QUICK_TUNNEL_STATE_PATH, {})
+            last_started_at = float(state.get("last_started_at") or 0)
+            wait_seconds = (last_started_at + min_interval) - time.time()
+            if wait_seconds > 0:
+                time.sleep(wait_seconds)
+            atomic_write_json(
+                QUICK_TUNNEL_STATE_PATH,
+                {"last_started_at": time.time()},
+            )
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 @contextmanager
 def cloudflare_quick_tunnel(local_url, settings=None):
     settings = settings or instagram_settings()
@@ -1481,41 +1535,58 @@ def cloudflare_quick_tunnel(local_url, settings=None):
             f"Temporarily rename {conflict} or switch INSTAGRAM_PUBLISH_METHOD=resumable."
         )
 
-    process = subprocess.Popen(
-        [binary_path, "tunnel", "--url", local_url],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        stdin=subprocess.DEVNULL,
-        text=True,
-        bufsize=1,
-    )
+    with quick_tunnel_slot(settings=settings):
+        process = subprocess.Popen(
+            [binary_path, "tunnel", "--url", local_url],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            text=True,
+            bufsize=1,
+        )
 
-    try:
-        public_origin = wait_for_trycloudflare_url(process, settings["quick_tunnel_timeout_seconds"])
-        yield {
-            "public_origin": public_origin,
-        }
-    finally:
-        terminate_subprocess(process)
+        try:
+            public_origin = wait_for_trycloudflare_url(process, settings["quick_tunnel_timeout_seconds"])
+            yield {
+                "public_origin": public_origin,
+            }
+        finally:
+            terminate_subprocess(process)
 
 
 @contextmanager
 def temporary_instagram_video_url(file_path, settings=None):
     settings = settings or instagram_settings()
+    max_attempts = max(int(settings.get("quick_tunnel_max_attempts") or 1), 1)
+    retry_delay_seconds = max(int(settings.get("quick_tunnel_retry_delay_seconds") or 1), 1)
+    last_error = None
+
     with serve_file_over_http(file_path) as local_server:
-        with cloudflare_quick_tunnel(local_server["local_url"], settings=settings) as tunnel:
-            public_url = f"{tunnel['public_origin']}{local_server['route']}"
-            probe = wait_for_public_video_url(
-                public_url,
-                timeout_seconds=max(settings["quick_tunnel_grace_seconds"], 0),
-                required=True,
-            )
-            yield {
-                "local_url": local_server["local_url"],
-                "public_origin": tunnel["public_origin"],
-                "public_url": public_url,
-                "probe": probe,
-            }
+        for attempt in range(1, max_attempts + 1):
+            try:
+                with cloudflare_quick_tunnel(local_server["local_url"], settings=settings) as tunnel:
+                    public_url = f"{tunnel['public_origin']}{local_server['route']}"
+                    probe = wait_for_public_video_url(
+                        public_url,
+                        timeout_seconds=max(settings["quick_tunnel_grace_seconds"], 0),
+                        required=True,
+                    )
+                    yield {
+                        "local_url": local_server["local_url"],
+                        "public_origin": tunnel["public_origin"],
+                        "public_url": public_url,
+                        "probe": probe,
+                    }
+                    return
+            except Exception as exc:
+                last_error = exc
+                if attempt >= max_attempts:
+                    break
+                time.sleep(retry_delay_seconds * attempt)
+
+    raise RuntimeError(
+        f"Cloudflare quick tunnel failed after {max_attempts} attempts. Last error: {last_error}"
+    ) from last_error
 
 
 def build_instagram_reel_payload(
@@ -1902,6 +1973,21 @@ def buffer_settings():
             "BUFFER_QUICK_TUNNEL_GRACE_SECONDS",
             DEFAULT_BUFFER_QUICK_TUNNEL_GRACE_SECONDS,
             minimum=0,
+        ),
+        "quick_tunnel_min_interval_seconds": env_int(
+            "BUFFER_QUICK_TUNNEL_MIN_INTERVAL_SECONDS",
+            DEFAULT_QUICK_TUNNEL_MIN_INTERVAL_SECONDS,
+            minimum=0,
+        ),
+        "quick_tunnel_max_attempts": env_int(
+            "BUFFER_QUICK_TUNNEL_MAX_ATTEMPTS",
+            DEFAULT_QUICK_TUNNEL_MAX_ATTEMPTS,
+            minimum=1,
+        ),
+        "quick_tunnel_retry_delay_seconds": env_int(
+            "BUFFER_QUICK_TUNNEL_RETRY_DELAY_SECONDS",
+            DEFAULT_QUICK_TUNNEL_RETRY_DELAY_SECONDS,
+            minimum=1,
         ),
         "tunnel_hold_seconds": env_int(
             "BUFFER_TUNNEL_HOLD_SECONDS",
