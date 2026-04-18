@@ -1657,6 +1657,8 @@ def serve_file_over_http(file_path):
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Disposition", f'inline; filename="{target.name}"')
             self.send_header("Content-Length", str(content_length))
+            self.send_header("Connection", "close")
+            self.close_connection = True
             if partial:
                 self.send_header("Content-Range", f"bytes {start}-{end}/{total_size}")
             self.end_headers()
@@ -1692,6 +1694,15 @@ def serve_file_over_http(file_path):
                         return
                     bytes_sent += len(chunk)
                     remaining -= len(chunk)
+            try:
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                print(
+                    "temporary video server: "
+                    f"{self.command} {request_path} disconnected during flush after {bytes_sent}/{content_length} bytes",
+                    file=sys.stderr,
+                )
+                return
             print(
                 "temporary video server: "
                 f"{self.command} {request_path} completed {bytes_sent}/{content_length} bytes",
