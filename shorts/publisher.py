@@ -100,6 +100,7 @@ DEFAULT_INSTAGRAM_QUICK_TUNNEL_GRACE_SECONDS = 90
 DEFAULT_QUICK_TUNNEL_MIN_INTERVAL_SECONDS = 30
 DEFAULT_QUICK_TUNNEL_MAX_ATTEMPTS = 2
 DEFAULT_QUICK_TUNNEL_RETRY_DELAY_SECONDS = 45
+DEFAULT_QUICK_TUNNEL_DOH_URL = "https://1.1.1.1/dns-query"
 DEFAULT_INSTAGRAM_CTA_TEXT = "Dont forget to Like and follow"
 DEFAULT_SHORTFORM_DESCRIPTION_TEXT = "3chan-style greentext story short."
 DEFAULT_SHORTFORM_HASHTAGS = ["#shorts", "#greentext", "#storytime"]
@@ -1237,6 +1238,9 @@ def instagram_settings():
             DEFAULT_QUICK_TUNNEL_RETRY_DELAY_SECONDS,
             minimum=1,
         ),
+        "quick_tunnel_doh_url": (
+            os.environ.get("INSTAGRAM_QUICK_TUNNEL_DOH_URL") or DEFAULT_QUICK_TUNNEL_DOH_URL
+        ).strip(),
     }
 
 
@@ -1570,6 +1574,7 @@ def temporary_instagram_video_url(file_path, settings=None):
                         public_url,
                         timeout_seconds=max(settings["quick_tunnel_grace_seconds"], 0),
                         required=True,
+                        doh_url=(settings.get("quick_tunnel_doh_url") or "").strip(),
                     )
                     yield {
                         "local_url": local_server["local_url"],
@@ -1664,7 +1669,62 @@ def build_instagram_caption(caption="", settings=None):
     )
 
 
-def wait_for_public_video_url(url, timeout_seconds=20, *, required=True):
+def probe_public_video_url_with_curl(url, *, doh_url=""):
+    curl_bin = shutil.which("curl")
+    if not curl_bin:
+        return {
+            "reachable": False,
+            "last_error": "curl not found",
+            "method": "curl_doh" if doh_url else "curl",
+        }
+
+    cmd = [
+        curl_bin,
+        "--silent",
+        "--show-error",
+        "--output",
+        os.devnull,
+        "--range",
+        "0-15",
+        "--write-out",
+        "%{http_code}",
+    ]
+    if doh_url:
+        cmd.extend(["--doh-url", doh_url])
+    cmd.append(url)
+
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+    except subprocess.TimeoutExpired:
+        return {
+            "reachable": False,
+            "last_error": "curl timed out",
+            "method": "curl_doh" if doh_url else "curl",
+        }
+
+    status_code = (result.stdout or "").strip()
+    if result.returncode == 0 and status_code in {"200", "206"}:
+        return {
+            "reachable": True,
+            "status_code": int(status_code),
+            "method": "curl_doh" if doh_url else "curl",
+        }
+
+    stderr = (result.stderr or "").strip()
+    detail = stderr or f"curl exit {result.returncode}, http {status_code or 'unknown'}"
+    return {
+        "reachable": False,
+        "last_error": detail,
+        "method": "curl_doh" if doh_url else "curl",
+    }
+
+
+def wait_for_public_video_url(url, timeout_seconds=20, *, required=True, doh_url=""):
     requests = require_requests()
     deadline = time.time() + timeout_seconds
     last_error = ""
@@ -1681,10 +1741,18 @@ def wait_for_public_video_url(url, timeout_seconds=20, *, required=True):
                     "reachable": True,
                     "status_code": response.status_code,
                     "content_length": response.headers.get("Content-Length"),
+                    "method": "requests",
                 }
             last_error = f"HTTP {response.status_code}"
         except requests.RequestException as exc:
             last_error = str(exc)
+            if doh_url and ("NameResolutionError" in last_error or "Failed to resolve" in last_error):
+                curl_probe = probe_public_video_url_with_curl(url, doh_url=doh_url)
+                if curl_probe.get("reachable"):
+                    return curl_probe
+                last_error = (
+                    f"{last_error}; fallback {curl_probe.get('method')}: {curl_probe.get('last_error')}"
+                )
         time.sleep(1)
 
     if required:
@@ -1694,6 +1762,7 @@ def wait_for_public_video_url(url, timeout_seconds=20, *, required=True):
     return {
         "reachable": False,
         "last_error": last_error,
+        "method": "requests",
     }
 
 
