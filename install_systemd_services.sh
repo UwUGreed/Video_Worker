@@ -47,7 +47,7 @@ EOF
 
 cat >"$SYSTEMD_DIR/video-worker-shorts-poster.service" <<EOF
 [Unit]
-Description=Upload the next queued Video Worker short to YouTube
+Description=Upload the next queued Video Worker short to enabled platforms
 Wants=network-online.target
 After=network-online.target
 
@@ -58,6 +58,8 @@ Group=$SERVICE_GROUP
 WorkingDirectory=$ROOT_DIR
 EnvironmentFile=-$ROOT_DIR/video-worker.env
 EnvironmentFile=-$ROOT_DIR/shorts/youtube.env
+EnvironmentFile=-$ROOT_DIR/shorts/instagram.env
+EnvironmentFile=-$ROOT_DIR/shorts/tiktok.env
 ExecStart=$ROOT_DIR/.venv/bin/python $ROOT_DIR/shorts/post_next_short.py
 EOF
 

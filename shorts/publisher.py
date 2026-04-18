@@ -102,6 +102,7 @@ DEFAULT_BUFFER_API_URL = "https://api.buffer.com"
 DEFAULT_BUFFER_CLOUDFLARED_BIN = "cloudflared"
 DEFAULT_BUFFER_QUICK_TUNNEL_TIMEOUT_SECONDS = DEFAULT_INSTAGRAM_QUICK_TUNNEL_TIMEOUT_SECONDS
 DEFAULT_BUFFER_QUICK_TUNNEL_GRACE_SECONDS = DEFAULT_INSTAGRAM_QUICK_TUNNEL_GRACE_SECONDS
+DEFAULT_BUFFER_TUNNEL_HOLD_SECONDS = 300
 DEFAULT_TIKTOK_PUBLISH_BACKEND = "native"
 DEFAULT_TIKTOK_POLL_SECONDS = 5
 DEFAULT_TIKTOK_POLL_TIMEOUT_SECONDS = 300
@@ -1709,9 +1710,25 @@ def post_reel_to_instagram(
                 upload_url=(create_response.get("uri") or "").strip(),
             )
 
-        status_snapshot = get_instagram_container_status(container_id, settings=settings)
-        if wait_for_finish:
-            status_snapshot = wait_for_instagram_container(container_id, settings=settings)
+        try:
+            status_snapshot = get_instagram_container_status(container_id, settings=settings)
+            if wait_for_finish:
+                status_snapshot = wait_for_instagram_container(container_id, settings=settings)
+        except Exception as exc:
+            context = {
+                "container_id": container_id,
+                "graph_host": settings["graph_host"],
+                "publish_method": method,
+                "hosted_video_url": hosted_video_url or None,
+                "hosted_video_probe": hosted_video_probe,
+                "create_response": create_response,
+                "payload_video_url": payload.get("video_url"),
+                "payload_upload_type": payload.get("upload_type"),
+            }
+            raise RuntimeError(
+                "Instagram processing failed before media_publish. "
+                f"{exc}. Context: {json.dumps(context, sort_keys=True, default=str)}"
+            ) from exc
 
         publish_url = (
             f"https://{settings['graph_host']}/{settings['api_version']}/{settings['ig_user_id']}/media_publish"
@@ -1884,6 +1901,11 @@ def buffer_settings():
         "quick_tunnel_grace_seconds": env_int(
             "BUFFER_QUICK_TUNNEL_GRACE_SECONDS",
             DEFAULT_BUFFER_QUICK_TUNNEL_GRACE_SECONDS,
+            minimum=0,
+        ),
+        "tunnel_hold_seconds": env_int(
+            "BUFFER_TUNNEL_HOLD_SECONDS",
+            DEFAULT_BUFFER_TUNNEL_HOLD_SECONDS,
             minimum=0,
         ),
     }
@@ -2492,33 +2514,11 @@ def post_video_to_tiktok_via_buffer(
 
     tiktok_title = build_tiktok_title(title, settings=settings)
     channel = query_buffer_tiktok_channel(settings=buffer)
-    error_fields = query_buffer_post_error_fields(settings=buffer)
     existing_result = dict(existing_platform_result or {})
     existing_buffer_post_id = (existing_result.get("buffer_post_id") or "").strip()
 
     if existing_buffer_post_id:
-        accepted_result = accept_buffer_tiktok_result(existing_result)
-        try:
-            post_snapshot = fetch_buffer_post(existing_buffer_post_id, settings=buffer, error_fields=error_fields)
-            post_status = (post_snapshot.get("status") or "").strip().lower()
-            if post_status not in {"sent", "error"} and wait_for_finish:
-                post_snapshot = wait_for_buffer_post(
-                    existing_buffer_post_id,
-                    settings=buffer,
-                    error_fields=error_fields,
-                )
-            post_status = (post_snapshot.get("status") or "").strip().lower() or "unknown"
-            if post_status == "error":
-                return accept_buffer_tiktok_result(
-                    build_buffer_tiktok_result(post_snapshot, channel, target, tiktok_title),
-                    followup_error=format_buffer_post_snapshot(post_snapshot),
-                    followup_snapshot=post_snapshot,
-                )
-            return build_buffer_tiktok_result(post_snapshot, channel, target, tiktok_title)
-        except Exception as exc:
-            if accepted_result:
-                return accept_buffer_tiktok_result(accepted_result, followup_error=str(exc))
-            raise
+        return accept_buffer_tiktok_result(existing_result)
 
     with temporary_buffer_video_url(target, settings=buffer) as hosted_video:
         created = buffer_graphql(
@@ -2584,30 +2584,11 @@ def post_video_to_tiktok_via_buffer(
         if not wait_for_finish:
             return accepted_result
 
-        try:
-            post_snapshot = wait_for_buffer_post(
-                post_snapshot.get("id"),
-                settings=buffer,
-                error_fields=error_fields,
-            )
-        except Exception as exc:
-            return accept_buffer_tiktok_result(accepted_result, followup_error=str(exc))
+        hold_seconds = int(buffer.get("tunnel_hold_seconds") or 0)
+        if hold_seconds > 0:
+            time.sleep(hold_seconds)
 
-        post_status = (post_snapshot.get("status") or "").strip().lower() or "unknown"
-        if post_status == "error":
-            return accept_buffer_tiktok_result(
-                accepted_result,
-                followup_error=format_buffer_post_snapshot(post_snapshot),
-                followup_snapshot=post_snapshot,
-            )
-
-        return build_buffer_tiktok_result(
-            post_snapshot,
-            channel,
-            target,
-            tiktok_title,
-            hosted_video_url=hosted_video["public_url"],
-        )
+        return accepted_result
 
 
 def upload_video_to_tiktok_draft(file_path, *, wait_for_finish=True):
