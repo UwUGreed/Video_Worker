@@ -94,7 +94,7 @@ DEFAULT_INSTAGRAM_POLL_SECONDS = 5
 DEFAULT_INSTAGRAM_POLL_TIMEOUT_SECONDS = 300
 DEFAULT_INSTAGRAM_PUBLISH_METHOD = "quick_tunnel"
 DEFAULT_INSTAGRAM_QUICK_TUNNEL_TIMEOUT_SECONDS = 45
-DEFAULT_INSTAGRAM_QUICK_TUNNEL_GRACE_SECONDS = 30
+DEFAULT_INSTAGRAM_QUICK_TUNNEL_GRACE_SECONDS = 90
 DEFAULT_INSTAGRAM_CTA_TEXT = "Dont forget to Like and follow"
 DEFAULT_SHORTFORM_DESCRIPTION_TEXT = "3chan-style greentext story short."
 DEFAULT_SHORTFORM_HASHTAGS = ["#shorts", "#greentext", "#storytime"]
@@ -1508,7 +1508,7 @@ def temporary_instagram_video_url(file_path, settings=None):
             probe = wait_for_public_video_url(
                 public_url,
                 timeout_seconds=max(settings["quick_tunnel_grace_seconds"], 0),
-                required=False,
+                required=True,
             )
             yield {
                 "local_url": local_server["local_url"],
