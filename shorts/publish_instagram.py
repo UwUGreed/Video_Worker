@@ -10,7 +10,15 @@ REPO_DIR = os.path.dirname(SCRIPT_DIR)
 if REPO_DIR not in sys.path:
     sys.path.insert(0, REPO_DIR)
 
-from shorts.publisher import check_instagram_token_valid, instagram_settings, post_reel_to_instagram
+from shorts.publisher import (
+    buffer_settings,
+    fetch_buffer_post,
+    format_buffer_post_snapshot,
+    query_buffer_post_error_fields,
+    check_instagram_token_valid,
+    instagram_settings,
+    post_reel_to_instagram,
+)
 
 
 def main():
@@ -24,6 +32,10 @@ def main():
         "--buffer",
         action="store_true",
         help="Publish through Buffer instead of the legacy direct Instagram API flow.",
+    )
+    parser.add_argument(
+        "--buffer-post-id",
+        help="Fetch one Buffer post status/error snapshot by id and exit. This is a diagnostic API read.",
     )
     parser.add_argument(
         "--check-token",
@@ -49,6 +61,21 @@ def main():
 
     if args.buffer:
         os.environ["INSTAGRAM_PUBLISH_BACKEND"] = "buffer"
+    if args.buffer_post_id:
+        settings = buffer_settings()
+        error_fields = query_buffer_post_error_fields(settings=settings)
+        snapshot = fetch_buffer_post(args.buffer_post_id, settings=settings, error_fields=error_fields)
+        print(
+            json.dumps(
+                {
+                    "status": "ok",
+                    "summary": format_buffer_post_snapshot(snapshot),
+                    "post": snapshot,
+                },
+                indent=2,
+            )
+        )
+        return
     if args.buffer and args.resumable_upload:
         parser.error("Buffer publishing does not use --resumable-upload. Remove that flag and retry.")
     if args.buffer and args.no_wait:
