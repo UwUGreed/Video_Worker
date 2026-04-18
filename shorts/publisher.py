@@ -556,6 +556,37 @@ def persist_queue_entry_platform_result(queue_id, platform, result):
     update_queue_entry(queue_id, updater)
 
 
+def persist_queue_entry_platform_progress(queue_id, platform, result):
+    def updater(item):
+        platform_results = queue_entry_platform_results(item)
+        existing = dict(platform_results.get(platform) or {})
+        merged = dict(existing)
+        merged.update(dict(result or {}))
+        platform_results[platform] = merged
+        item["platform_results"] = platform_results
+        item["last_error"] = None
+
+    update_queue_entry(queue_id, updater)
+
+
+def accept_buffer_tiktok_result(result, *, followup_error="", followup_snapshot=None):
+    normalized = dict(result or {})
+    buffer_post_id = (normalized.get("buffer_post_id") or normalized.get("id") or "").strip()
+    if not buffer_post_id:
+        return {}
+
+    normalized["buffer_post_id"] = buffer_post_id
+    normalized["status"] = "accepted"
+    normalized["platform"] = "tiktok"
+    normalized["provider"] = "buffer"
+    normalized["buffer_post_accepted"] = True
+    if followup_error:
+        normalized["buffer_followup_error"] = followup_error
+    if followup_snapshot is not None:
+        normalized["buffer_followup_snapshot"] = format_buffer_post_snapshot(followup_snapshot)
+    return normalized
+
+
 def queue_platform_error_message(errors):
     return "; ".join(f"{platform}: {message}" for platform, message in errors.items())
 
@@ -573,8 +604,8 @@ def post_reserved_queue_entry_to_platforms(entry, *, interactive_auth=False, pla
     errors = {}
 
     for platform in active_platforms:
+        existing_result = (queue_entry_platform_results(working_entry).get(platform) or {})
         if queue_entry_platform_completed(working_entry, platform):
-            existing_result = (queue_entry_platform_results(working_entry).get(platform) or {})
             if existing_result:
                 completed_results[platform] = existing_result
             continue
@@ -585,8 +616,29 @@ def post_reserved_queue_entry_to_platforms(entry, *, interactive_auth=False, pla
             elif platform == "instagram":
                 result = post_reel_to_instagram(working_entry["file_path"], caption)
             else:
-                result = post_video_to_tiktok(working_entry["file_path"], caption)
+                result = post_video_to_tiktok(
+                    working_entry["file_path"],
+                    caption,
+                    existing_platform_result=existing_result,
+                    progress_callback=(
+                        lambda partial_result, queue_id=working_entry["queue_id"]: persist_queue_entry_platform_progress(
+                            queue_id,
+                            "tiktok",
+                            partial_result,
+                        )
+                    ),
+                )
         except Exception as exc:
+            if platform == "tiktok":
+                accepted_result = accept_buffer_tiktok_result(
+                    queue_entry_platform_results(working_entry).get("tiktok") or existing_result,
+                    followup_error=str(exc),
+                )
+                if accepted_result:
+                    completed_results[platform] = dict(accepted_result)
+                    persist_queue_entry_platform_result(working_entry["queue_id"], platform, accepted_result)
+                    apply_queue_entry_platform_result(working_entry, platform, accepted_result)
+                    continue
             errors[platform] = str(exc)
             continue
 
@@ -928,6 +980,15 @@ def post_next_queued_short(
             interactive_auth=interactive_auth,
             platform_targets=queue_platform_targets(force_all_platforms=force_all_platforms),
         )
+    except KeyboardInterrupt:
+        release_reserved(entry["queue_id"])
+        cleanup_summary = run_storage_maintenance()
+        return {
+            "status": "interrupted",
+            "queue_id": entry["queue_id"],
+            "message": "Posting was interrupted before completion.",
+            "cleanup": cleanup_summary,
+        }
     except Exception as exc:
         mark_failed(entry["queue_id"], str(exc))
         cleanup_summary = run_storage_maintenance()
@@ -1316,7 +1377,11 @@ def serve_file_over_http(file_path):
                     chunk = handle.read(min(1024 * 1024, remaining))
                     if not chunk:
                         break
-                    self.wfile.write(chunk)
+                    try:
+                        self.wfile.write(chunk)
+                    except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                        # Buffer and other fetchers may close the socket as soon as they have what they need.
+                        return
                     remaining -= len(chunk)
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), SingleFileRequestHandler)
@@ -2023,6 +2088,27 @@ def format_buffer_post_snapshot(snapshot):
     return ", ".join(parts) or "no status details"
 
 
+def build_buffer_tiktok_result(post_snapshot, channel, target, tiktok_title, *, hosted_video_url=None):
+    result = {
+        "status": (post_snapshot.get("status") or "").strip().lower() or "unknown",
+        "platform": "tiktok",
+        "provider": "buffer",
+        "file_path": str(target),
+        "title": tiktok_title or None,
+        "buffer_post_id": post_snapshot.get("id"),
+        "buffer_share_mode": post_snapshot.get("shareMode"),
+        "buffer_scheduling_type": post_snapshot.get("schedulingType"),
+        "buffer_shared_now": post_snapshot.get("sharedNow"),
+        "buffer_sent_at": post_snapshot.get("sentAt"),
+        "buffer_channel_id": channel.get("id"),
+        "buffer_channel_name": channel.get("displayName") or channel.get("name"),
+        "buffer_organization": channel.get("organization_name"),
+    }
+    if hosted_video_url:
+        result["hosted_video_url"] = hosted_video_url
+    return result
+
+
 def wait_for_buffer_post(post_id, settings=None, *, error_fields=None):
     settings = settings or buffer_settings()
     deadline = time.time() + settings["poll_timeout_seconds"]
@@ -2384,7 +2470,14 @@ def tiktok_upload_file(upload_url, upload_plan):
     }
 
 
-def post_video_to_tiktok_via_buffer(file_path, title="", *, wait_for_finish=True):
+def post_video_to_tiktok_via_buffer(
+    file_path,
+    title="",
+    *,
+    wait_for_finish=True,
+    existing_platform_result=None,
+    progress_callback=None,
+):
     if not wait_for_finish:
         raise RuntimeError(
             "Buffer-backed TikTok publishing requires waiting so the temporary Cloudflare video URL stays online "
@@ -2400,6 +2493,32 @@ def post_video_to_tiktok_via_buffer(file_path, title="", *, wait_for_finish=True
     tiktok_title = build_tiktok_title(title, settings=settings)
     channel = query_buffer_tiktok_channel(settings=buffer)
     error_fields = query_buffer_post_error_fields(settings=buffer)
+    existing_result = dict(existing_platform_result or {})
+    existing_buffer_post_id = (existing_result.get("buffer_post_id") or "").strip()
+
+    if existing_buffer_post_id:
+        accepted_result = accept_buffer_tiktok_result(existing_result)
+        try:
+            post_snapshot = fetch_buffer_post(existing_buffer_post_id, settings=buffer, error_fields=error_fields)
+            post_status = (post_snapshot.get("status") or "").strip().lower()
+            if post_status not in {"sent", "error"} and wait_for_finish:
+                post_snapshot = wait_for_buffer_post(
+                    existing_buffer_post_id,
+                    settings=buffer,
+                    error_fields=error_fields,
+                )
+            post_status = (post_snapshot.get("status") or "").strip().lower() or "unknown"
+            if post_status == "error":
+                return accept_buffer_tiktok_result(
+                    build_buffer_tiktok_result(post_snapshot, channel, target, tiktok_title),
+                    followup_error=format_buffer_post_snapshot(post_snapshot),
+                    followup_snapshot=post_snapshot,
+                )
+            return build_buffer_tiktok_result(post_snapshot, channel, target, tiktok_title)
+        except Exception as exc:
+            if accepted_result:
+                return accept_buffer_tiktok_result(accepted_result, followup_error=str(exc))
+            raise
 
     with temporary_buffer_video_url(target, settings=buffer) as hosted_video:
         created = buffer_graphql(
@@ -2451,36 +2570,44 @@ def post_video_to_tiktok_via_buffer(file_path, title="", *, wait_for_finish=True
             raise RuntimeError(message)
 
         post_snapshot = created.get("post") or {}
-        if wait_for_finish:
+        accepted_result = accept_buffer_tiktok_result(
+            build_buffer_tiktok_result(
+                post_snapshot,
+                channel,
+                target,
+                tiktok_title,
+                hosted_video_url=hosted_video["public_url"],
+            )
+        )
+        if progress_callback and accepted_result:
+            progress_callback(accepted_result)
+        if not wait_for_finish:
+            return accepted_result
+
+        try:
             post_snapshot = wait_for_buffer_post(
                 post_snapshot.get("id"),
                 settings=buffer,
                 error_fields=error_fields,
             )
+        except Exception as exc:
+            return accept_buffer_tiktok_result(accepted_result, followup_error=str(exc))
 
         post_status = (post_snapshot.get("status") or "").strip().lower() or "unknown"
         if post_status == "error":
-            raise RuntimeError(
-                "Buffer TikTok publishing failed: "
-                f"{format_buffer_post_snapshot(post_snapshot)}"
+            return accept_buffer_tiktok_result(
+                accepted_result,
+                followup_error=format_buffer_post_snapshot(post_snapshot),
+                followup_snapshot=post_snapshot,
             )
 
-        return {
-            "status": post_status,
-            "platform": "tiktok",
-            "provider": "buffer",
-            "file_path": str(target),
-            "title": tiktok_title or None,
-            "buffer_post_id": post_snapshot.get("id"),
-            "buffer_share_mode": post_snapshot.get("shareMode"),
-            "buffer_scheduling_type": post_snapshot.get("schedulingType"),
-            "buffer_shared_now": post_snapshot.get("sharedNow"),
-            "buffer_sent_at": post_snapshot.get("sentAt"),
-            "buffer_channel_id": channel.get("id"),
-            "buffer_channel_name": channel.get("displayName") or channel.get("name"),
-            "buffer_organization": channel.get("organization_name"),
-            "hosted_video_url": hosted_video["public_url"],
-        }
+        return build_buffer_tiktok_result(
+            post_snapshot,
+            channel,
+            target,
+            tiktok_title,
+            hosted_video_url=hosted_video["public_url"],
+        )
 
 
 def upload_video_to_tiktok_draft(file_path, *, wait_for_finish=True):
@@ -2547,6 +2674,8 @@ def post_video_to_tiktok(
     cover_timestamp_ms=None,
     is_aigc=None,
     wait_for_finish=True,
+    existing_platform_result=None,
+    progress_callback=None,
 ):
     settings = tiktok_settings()
     if settings["publish_backend"] == "buffer":
@@ -2572,6 +2701,8 @@ def post_video_to_tiktok(
             file_path,
             title,
             wait_for_finish=wait_for_finish,
+            existing_platform_result=existing_platform_result,
+            progress_callback=progress_callback,
         )
     target = Path(file_path).expanduser().resolve()
 
