@@ -3211,6 +3211,8 @@ def sanitized_instagram_upload_file(file_path):
             "-1",
             "-r",
             "30",
+            "-fps_mode",
+            "cfr",
             "-g",
             "60",
             "-keyint_min",
@@ -3232,7 +3234,7 @@ def sanitized_instagram_upload_file(file_path):
             "-c:a",
             "aac",
             "-b:a",
-            "128k",
+            "96k",
             "-ar",
             "48000",
             "-ac",
@@ -3258,6 +3260,10 @@ def sanitized_instagram_upload_file(file_path):
             ((stream or {}) for stream in sanitized_streams if (stream.get("codec_type") or "").strip() == "video"),
             {},
         )
+        sanitized_audio_stream = next(
+            ((stream or {}) for stream in sanitized_streams if (stream.get("codec_type") or "").strip() == "audio"),
+            {},
+        )
         sanitized_has_audio = any(
             (stream.get("codec_type") or "").strip() == "audio" for stream in sanitized_streams
         )
@@ -3265,12 +3271,22 @@ def sanitized_instagram_upload_file(file_path):
         sanitized_fps = ffprobe_rate_to_fps(
             sanitized_video_stream.get("avg_frame_rate") or sanitized_video_stream.get("r_frame_rate") or ""
         )
+        try:
+            sanitized_duration = float((sanitized_probe.get("format") or {}).get("duration") or 0.0)
+        except (TypeError, ValueError):
+            sanitized_duration = 0.0
         print(
             "instagram sanitized: "
             f"codec={sanitized_video_stream.get('codec_name') or 'unknown'} "
+            f"profile={sanitized_video_stream.get('profile') or 'unknown'} "
+            f"level={sanitized_video_stream.get('level') or 'unknown'} "
+            f"pix_fmt={sanitized_video_stream.get('pix_fmt') or 'unknown'} "
             f"fps={format_debug_fps(sanitized_fps)} "
             f"res={sanitized_video_stream.get('width') or 0}x{sanitized_video_stream.get('height') or 0} "
+            f"sar={sanitized_video_stream.get('sample_aspect_ratio') or 'unknown'} "
             f"audio={sanitized_has_audio} "
+            f"audio_bitrate={sanitized_audio_stream.get('bit_rate') or 'unknown'} "
+            f"duration={sanitized_duration:.1f}s "
             f"size={sanitized_size_mb:.1f}MB"
         )
         yield sanitized_path
