@@ -1609,6 +1609,11 @@ def serve_file_over_http(file_path):
         def _serve(self, *, send_body):
             request_path = urlsplit(self.path).path
             if request_path != route:
+                print(
+                    "temporary video server: "
+                    f"{self.command} {request_path} -> 404 expected={route}",
+                    file=sys.stderr,
+                )
                 self.send_error(404)
                 return
 
@@ -1645,9 +1650,18 @@ def serve_file_over_http(file_path):
                 self.send_header("Content-Range", f"bytes {start}-{end}/{total_size}")
             self.end_headers()
 
+            status_code = 206 if partial else 200
+            print(
+                "temporary video server: "
+                f"{self.command} {request_path} -> {status_code} "
+                f"range={range_header or '-'} bytes={content_length}/{total_size}",
+                file=sys.stderr,
+            )
+
             if not send_body or content_length <= 0:
                 return
 
+            bytes_sent = 0
             with open(target, "rb") as handle:
                 handle.seek(start)
                 remaining = content_length
@@ -1659,8 +1673,19 @@ def serve_file_over_http(file_path):
                         self.wfile.write(chunk)
                     except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                         # Buffer and other fetchers may close the socket as soon as they have what they need.
+                        print(
+                            "temporary video server: "
+                            f"{self.command} {request_path} disconnected after {bytes_sent}/{content_length} bytes",
+                            file=sys.stderr,
+                        )
                         return
+                    bytes_sent += len(chunk)
                     remaining -= len(chunk)
+            print(
+                "temporary video server: "
+                f"{self.command} {request_path} completed {bytes_sent}/{content_length} bytes",
+                file=sys.stderr,
+            )
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), SingleFileRequestHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
