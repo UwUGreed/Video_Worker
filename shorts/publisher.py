@@ -1665,11 +1665,13 @@ def serve_file_over_http(file_path):
     server = ThreadingHTTPServer(("127.0.0.1", 0), SingleFileRequestHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    local_url = f"http://127.0.0.1:{server.server_address[1]}{route}"
+    local_origin = f"http://127.0.0.1:{server.server_address[1]}"
+    local_url = f"{local_origin}{route}"
 
     try:
         yield {
             "file_path": str(target),
+            "local_origin": local_origin,
             "local_url": local_url,
             "route": route,
         }
@@ -1822,7 +1824,9 @@ def temporary_instagram_video_url(file_path, settings=None):
         active_stack = ExitStack()
         try:
             local_server = active_stack.enter_context(serve_file_over_http(file_path))
-            tunnel = active_stack.enter_context(cloudflare_quick_tunnel(local_server["local_url"], settings=settings))
+            tunnel = active_stack.enter_context(
+                cloudflare_quick_tunnel(local_server["local_origin"], settings=settings)
+            )
             public_url = f"{tunnel['public_origin']}{local_server['route']}"
             settle_seconds = max(int(settings.get("quick_tunnel_settle_seconds") or 0), 0)
             if settle_seconds > 0:
